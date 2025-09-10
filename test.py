@@ -169,8 +169,7 @@ def main():
     test_loader = build_loader(args)
 
     # Model
-    model = MGVLF(bert_model=args.bert_model, tunebert=True, args=args)
-    model = torch.nn.DataParallel(model).cuda()
+    model = MGVLF(bert_model=args.bert_model, tunebert=True, args=args).cuda()
 
     if args.resume:
         model = load_resume(model, args, logging)
