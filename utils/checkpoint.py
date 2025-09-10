@@ -16,23 +16,42 @@ def save_checkpoint(state, is_best, args, filename='default'):
 
 def load_pretrain(model, args, logging):
     if os.path.isfile(args.pretrain):
-        checkpoint = torch.load(args.pretrain)
-        pretrained_dict = checkpoint['state_dict']
+        checkpoint = torch.load(args.pretrain, map_location="cpu")
+
+        # linh hoạt lấy state_dict
+        if "state_dict" in checkpoint:
+            pretrained_dict = checkpoint["state_dict"]
+        elif "model" in checkpoint:
+            pretrained_dict = checkpoint["model"]
+        else:
+            # nếu file chỉ là raw state_dict
+            pretrained_dict = checkpoint
+
         model_dict = model.state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-        assert (len([k for k, v in pretrained_dict.items()])!=0)
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
-        print("=> loaded pretrain model at {}"
-              .format(args.pretrain))
-        logging.info("=> loaded pretrain model at {}"
-              .format(args.pretrain))
-        del checkpoint  # dereference seems crucial
+        # lọc các key khớp shape
+        pretrained_dict = {
+            k: v for k, v in pretrained_dict.items()
+            if k in model_dict and model_dict[k].shape == v.shape
+        }
+
+        if len(pretrained_dict) == 0:
+            print(f"=> WARNING: no matching keys in {args.pretrain}")
+            logging.info(f"=> WARNING: no matching keys in {args.pretrain}")
+        else:
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict, strict=False)
+            print(f"=> loaded pretrain model at {args.pretrain} "
+                  f"({len(pretrained_dict)} keys matched)")
+            logging.info(f"=> loaded pretrain model at {args.pretrain} "
+                         f"({len(pretrained_dict)} keys matched)")
+
+        del checkpoint
         torch.cuda.empty_cache()
     else:
-        print(("=> no pretrained file found at '{}'".format(args.pretrain)))
-        logging.info("=> no pretrained file found at '{}'".format(args.pretrain))
+        print(f"=> no pretrained file found at '{args.pretrain}'")
+        logging.info(f"=> no pretrained file found at '{args.pretrain}'")
     return model
+
 
 def load_resume(model, args, logging):
     if os.path.isfile(args.resume):
