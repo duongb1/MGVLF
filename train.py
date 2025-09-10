@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+# main.py 
 """
 Train + Validate for MGVLF
 """
@@ -20,9 +19,12 @@ from torchvision.transforms import Compose, ToTensor, Normalize
 
 from data_loader import RSVGDataset
 from models.model import MGVLF
-from models.loss import Reg_Loss, GIoU_Loss
+from utils.loss import Reg_Loss, GIoU_Loss
 from utils.utils import AverageMeter, xyxy2xywh, bbox_iou, adjust_learning_rate
 from utils.checkpoint import save_checkpoint, load_pretrain, load_resume
+
+# ===== AMP: import autocast + GradScaler =====
+from torch.cuda.amp import autocast, GradScaler
 
 
 def parse_args():
@@ -60,6 +62,7 @@ def parse_args():
     parser.add_argument('--nheads', default=8, type=int)
     parser.add_argument('--num_queries', default=400 + 40 + 1, type=int)
     parser.add_argument('--pre_norm', action='store_true')
+
     return parser.parse_args()
 
 
@@ -84,7 +87,7 @@ def build_loaders(args):
 
 
 def build_model(args):
-    model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args).cuda()
+    model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args).cuda()  # ✅ single-GPU
 
     if args.pretrain:
         model = load_pretrain(model, args, logging)
@@ -97,17 +100,12 @@ def build_model(args):
 
     # ==== group params (SO SÁNH THEO IDENTITY) ====
     if args.tunebert:
-        # Lấy list ngay từ đầu để có object identity ổn định
         visu_param = list(model.visumodel.parameters())
         text_param = list(model.textmodel.parameters())
-
         visu_ids = {id(p) for p in visu_param}
         text_ids = {id(p) for p in text_param}
-
-        # phần còn lại = tất cả trừ 2 nhóm trên (theo id)
         rest_param = [p for p in model.parameters() if id(p) not in visu_ids and id(p) not in text_ids]
 
-        # (tuỳ chọn) chỉ lấy params trainable
         visu_param = [p for p in visu_param if p.requires_grad]
         text_param = [p for p in text_param if p.requires_grad]
         rest_param = [p for p in rest_param if p.requires_grad]
@@ -127,10 +125,8 @@ def build_model(args):
         print('visu, text, fusion module parameters:', sum_visu, sum_text, sum_rest)
 
     else:
-        # Không tune BERT: có thể freeze text model (đã set trong MGVLF) hoặc để nguyên
         visu_param = list(model.visumodel.parameters())
         visu_ids = {id(p) for p in visu_param}
-
         rest_param = [p for p in model.parameters() if id(p) not in visu_ids]
 
         visu_param = [p for p in visu_param if p.requires_grad]
@@ -147,8 +143,6 @@ def build_model(args):
         sum_visu = sum(p.nelement() for p in visu_param)
         sum_text_total = sum(p.nelement() for p in model.textmodel.parameters())
         sum_rest = sum(p.nelement() for p in rest_param)
-        # fusion ~ rest; nếu text bị freeze, nó nằm trong rest về mặt tổng số param ALL,
-        # nhưng không ảnh hưởng training vì requires_grad=False sẽ không vào optimizer.
         print('visu, text(total), fusion(rest) parameters:', sum_visu, sum_text_total, sum_rest)
 
     # ==== sanity checks để tránh sót/đúp ====
@@ -165,7 +159,7 @@ def build_model(args):
 
 
 
-def train_epoch(train_loader, model, optimizer, epoch, args):
+def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
     batch_time = AverageMeter()
     losses = AverageMeter()
     l1_losses = AverageMeter()
@@ -190,27 +184,35 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
         gt_bbox = Variable(gt_bbox)
         gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(image, masks, word_id, word_mask)
+        # ====== AMP: forward dưới autocast (model fp16/bf16), loss ở fp32 ======
+        with autocast(dtype=torch.float16):
+            pred_bbox = model(image, masks, word_id, word_mask)
 
-        # loss
-        loss = 0.
-        giou = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
-        loss += giou
-        gt_bbox_ = xyxy2xywh(gt_bbox)
-        l1 = Reg_Loss(pred_bbox, gt_bbox_ / (args.size - 1))
-        loss += l1
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_bbox_f = pred_bbox.float()
+            gt_bbox_f = gt_bbox.float()
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # loss
+            loss = 0.
+            giou = GIoU_Loss(pred_bbox_f * (args.size - 1), gt_bbox_f, args.size - 1)
+            loss += giou
+            gt_bbox_xywh = xyxy2xywh(gt_bbox_f)
+            l1 = Reg_Loss(pred_bbox_f, gt_bbox_xywh / (args.size - 1))
+            loss += l1
+
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
         losses.update(loss.item(), imgs.size(0))
         l1_losses.update(l1.item(), imgs.size(0))
         GIoU_losses.update(giou.item(), imgs.size(0))
 
         # metrics
-        pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
-                               pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
-        iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox.data.cpu(), x1y1x2y2=True)
+        pred_xyxy = torch.cat([pred_bbox_f[:, :2] - (pred_bbox_f[:, 2:] / 2),
+                               pred_bbox_f[:, :2] + (pred_bbox_f[:, 2:] / 2)], dim=1) * (args.size - 1)
+        iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
         cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
         cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))
         accu5 = np.mean((iou.data.cpu().numpy() > 0.5).astype(float))
@@ -265,34 +267,40 @@ def validate_epoch(val_loader, model, args):
         word_id = Variable(word_id); word_mask = Variable(word_mask)
         bbox = Variable(bbox)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
-
-        pred_bbox = model(image, masks, word_id, word_mask)
         gt_bbox = bbox
 
-        # loss
-        loss = 0.
-        giou = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1); loss += giou
-        gt_bbox_ = xyxy2xywh(gt_bbox)
-        l1 = Reg_Loss(pred_bbox, gt_bbox_ / (args.size - 1)); loss += l1
+        # ====== AMP: chỉ forward ở autocast, còn lại fp32 ======
+        with autocast(dtype=torch.float16):
+            pred_bbox = model(image, masks, word_id, word_mask)
 
-        losses.update(loss.item(), imgs.size(0)); l1_losses.update(l1.item(), imgs.size(0)); GIoU_losses.update(giou.item(), imgs.size(0))
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_bbox_f = pred_bbox.float()
+            gt_bbox_f = gt_bbox.float()
 
-        # metrics
-        pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
-                               pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
-        iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox.data.cpu(), x1y1x2y2=True)
-        cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
-        cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))
-        accu5 = np.mean((iou.data.cpu().numpy() > 0.5).astype(float))
-        accu6 = np.mean((iou.data.cpu().numpy() > 0.6).astype(float))
-        accu7 = np.mean((iou.data.cpu().numpy() > 0.7).astype(float))
-        accu8 = np.mean((iou.data.cpu().numpy() > 0.8).astype(float))
-        accu9 = np.mean((iou.data.cpu().numpy() > 0.9).astype(float))
+            # loss (để theo dõi)
+            loss = 0.
+            giou = GIoU_Loss(pred_bbox_f * (args.size - 1), gt_bbox_f, args.size - 1); loss += giou
+            gt_bbox_xywh = xyxy2xywh(gt_bbox_f)
+            l1 = Reg_Loss(pred_bbox_f, gt_bbox_xywh / (args.size - 1)); loss += l1
 
-        meanIoU.update(torch.mean(iou).item(), imgs.size(0))
-        inter_area.update(cumInterArea); union_area.update(cumUnionArea)
-        acc5.update(accu5, imgs.size(0)); acc6.update(accu6, imgs.size(0))
-        acc7.update(accu7, imgs.size(0)); acc8.update(accu8, imgs.size(0)); acc9.update(accu9, imgs.size(0))
+            losses.update(loss.item(), imgs.size(0)); l1_losses.update(l1.item(), imgs.size(0)); GIoU_losses.update(giou.item(), imgs.size(0))
+
+            # metrics
+            pred_xyxy = torch.cat([pred_bbox_f[:, :2] - (pred_bbox_f[:, 2:] / 2),
+                                   pred_bbox_f[:, :2] + (pred_bbox_f[:, 2:] / 2)], dim=1) * (args.size - 1)
+            iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
+            cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
+            cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))
+            accu5 = np.mean((iou.data.cpu().numpy() > 0.5).astype(float))
+            accu6 = np.mean((iou.data.cpu().numpy() > 0.6).astype(float))
+            accu7 = np.mean((iou.data.cpu().numpy() > 0.7).astype(float))
+            accu8 = np.mean((iou.data.cpu().numpy() > 0.8).astype(float))
+            accu9 = np.mean((iou.data.cpu().numpy() > 0.9).astype(float))
+
+            meanIoU.update(torch.mean(iou).item(), imgs.size(0))
+            inter_area.update(cumInterArea); union_area.update(cumUnionArea)
+            acc5.update(accu5, imgs.size(0)); acc6.update(accu6, imgs.size(0))
+            acc7.update(accu7, imgs.size(0)); acc8.update(accu8, imgs.size(0)); acc9.update(accu9, imgs.size(0))
 
         # time
         batch_time.update(time.time() - end); end = time.time()
@@ -340,11 +348,14 @@ def main():
     train_loader, val_loader = build_loaders(args)
     model, optimizer = build_model(args)
 
+    # ===== AMP: khởi tạo GradScaler =====
+    scaler = GradScaler()
+
     # train loop
     best_accu = -float('Inf')
     for epoch in range(args.nb_epoch):
         adjust_learning_rate(args, optimizer, epoch)
-        _ = train_epoch(train_loader, model, optimizer, epoch, args)
+        _ = train_epoch(train_loader, model, optimizer, epoch, args, scaler)
         v_metrics = validate_epoch(val_loader, model, args)
 
         acc_new = v_metrics[0]
