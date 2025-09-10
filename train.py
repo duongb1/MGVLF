@@ -92,41 +92,78 @@ def build_model(args):
     if args.resume:
         model = load_resume(model, args, logging)
 
-    print('Num of parameters:', sum(p.nelement() for p in model.parameters()))
-    logging.info('Num of parameters:%d' % int(sum(p.nelement() for p in model.parameters())))
+    num_params = sum(p.nelement() for p in model.parameters())
+    print('Num of parameters:', num_params)
+    logging.info('Num of parameters:%d' % int(num_params))
 
-    # group params
+    # ==== group params (SO SÁNH THEO IDENTITY) ====
     if args.tunebert:
-        visu_param = model.module.visumodel.parameters()
-        text_param = model.module.textmodel.parameters()
-        rest_param = [p for p in model.parameters() if ((p not in visu_param) and (p not in text_param))]
+        # Lấy list ngay từ đầu để có object identity ổn định
         visu_param = list(model.module.visumodel.parameters())
         text_param = list(model.module.textmodel.parameters())
+
+        visu_ids = {id(p) for p in visu_param}
+        text_ids = {id(p) for p in text_param}
+
+        # phần còn lại = tất cả trừ 2 nhóm trên (theo id)
+        rest_param = [p for p in model.parameters() if id(p) not in visu_ids and id(p) not in text_ids]
+
+        # (tuỳ chọn) chỉ lấy params trainable
+        visu_param = [p for p in visu_param if p.requires_grad]
+        text_param = [p for p in text_param if p.requires_grad]
+        rest_param = [p for p in rest_param if p.requires_grad]
+
         optimizer = torch.optim.AdamW(
-            [{'params': rest_param},
-             {'params': visu_param, 'lr': args.lr / 10.},
-             {'params': text_param, 'lr': args.lr / 10.}],
-            lr=args.lr, weight_decay=0.0001
+            [
+                {'params': rest_param, 'lr': args.lr},
+                {'params': visu_param, 'lr': args.lr / 10.0},
+                {'params': text_param, 'lr': args.lr / 10.0},
+            ],
+            lr=args.lr, weight_decay=1e-4
         )
+
         sum_visu = sum(p.nelement() for p in visu_param)
         sum_text = sum(p.nelement() for p in text_param)
-        sum_fusion = sum(p.nelement() for p in rest_param)
-        print('visu, text, fusion module parameters:', sum_visu, sum_text, sum_fusion)
+        sum_rest = sum(p.nelement() for p in rest_param)
+        print('visu, text, fusion module parameters:', sum_visu, sum_text, sum_rest)
+
     else:
-        visu_param = model.module.visumodel.parameters()
-        rest_param = [p for p in model.parameters() if p not in visu_param]
+        # Không tune BERT: có thể freeze text model (đã set trong MGVLF) hoặc để nguyên
         visu_param = list(model.module.visumodel.parameters())
+        visu_ids = {id(p) for p in visu_param}
+
+        rest_param = [p for p in model.parameters() if id(p) not in visu_ids]
+
+        visu_param = [p for p in visu_param if p.requires_grad]
+        rest_param = [p for p in rest_param if p.requires_grad]
+
         optimizer = torch.optim.AdamW(
-            [{'params': rest_param},
-             {'params': visu_param}],
-            lr=args.lr, weight_decay=0.0001
+            [
+                {'params': rest_param, 'lr': args.lr},
+                {'params': visu_param, 'lr': args.lr},
+            ],
+            lr=args.lr, weight_decay=1e-4
         )
+
         sum_visu = sum(p.nelement() for p in visu_param)
-        sum_text = sum(p.nelement() for p in model.module.textmodel.parameters())
-        sum_fusion = sum(p.nelement() for p in rest_param) - sum_text
-        print('visu, text, fusion module parameters:', sum_visu, sum_text, sum_fusion)
+        sum_text_total = sum(p.nelement() for p in model.module.textmodel.parameters())
+        sum_rest = sum(p.nelement() for p in rest_param)
+        # fusion ~ rest; nếu text bị freeze, nó nằm trong rest về mặt tổng số param ALL,
+        # nhưng không ảnh hưởng training vì requires_grad=False sẽ không vào optimizer.
+        print('visu, text(total), fusion(rest) parameters:', sum_visu, sum_text_total, sum_rest)
+
+    # ==== sanity checks để tránh sót/đúp ====
+    all_ids = {id(p) for p in model.parameters() if p.requires_grad}
+    grouped_ids = set()
+    for g in optimizer.param_groups:
+        for p in g['params']:
+            grouped_ids.add(id(p))
+
+    assert all_ids == grouped_ids, \
+        f"Param grouping mismatch: all_grad={len(all_ids)} grouped={len(grouped_ids)}"
 
     return model, optimizer
+
 
 
 def train_epoch(train_loader, model, optimizer, epoch, args):
