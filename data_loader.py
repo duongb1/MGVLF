@@ -28,7 +28,6 @@ class RSVGDataset(data.Dataset):
         self.testmode = testmode
         self.query_len = max_query_len  # 40
 
-        # NEW: AutoTokenizer (thay cho pytorch_pretrained_bert.BertTokenizer)
         self.tokenizer = AutoTokenizer.from_pretrained(bert_model, use_fast=True)
 
         file = open('./dior-rsvg/' + split + '.txt', "r").readlines()
