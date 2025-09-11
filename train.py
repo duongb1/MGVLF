@@ -29,10 +29,14 @@ from torch.cuda.amp import autocast, GradScaler
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MGVLF Train/Val')
+
+    # ===== Dataset =====
     parser.add_argument('--size', default=640, type=int, help='image size')
     parser.add_argument('--images_path', type=str, default='./DIOR_RSVG/JPEGImages')
     parser.add_argument('--anno_path', type=str, default='./DIOR_RSVG/Annotations')
     parser.add_argument('--time', default=40, type=int, help='max language length')
+
+    # ===== Training =====
     parser.add_argument('--gpu', default='0', help='gpu id')
     parser.add_argument('--workers', default=0, type=int)
     parser.add_argument('--nb_epoch', default=150, type=int)
@@ -44,10 +48,12 @@ def parse_args():
     parser.add_argument('--print_freq', '-p', default=50, type=int)
     parser.add_argument('--savename', default='default', type=str)
     parser.add_argument('--seed', default=13, type=int)
+
+    # ===== Language encoder =====
     parser.add_argument('--bert_model', default='bert-base-uncased', type=str)
     parser.add_argument('--tunebert', dest='tunebert', default=True, action='store_true')
 
-    # * DETR / backbone / transformer
+    # ===== Visual encoder / Transformer =====
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--masks', action='store_true')
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false')
@@ -60,10 +66,16 @@ def parse_args():
     parser.add_argument('--hidden_dim', default=256, type=int)
     parser.add_argument('--dropout', default=0.1, type=float)
     parser.add_argument('--nheads', default=8, type=int)
-    parser.add_argument('--num_queries', default=400 + 40 + 1, type=int)
     parser.add_argument('--pre_norm', action='store_true')
+    
+    # ===== Position Encoding Configuration =====
+    parser.add_argument('--img_pe_type', default='sine', choices=['sine','learned2d'], help='Position encoding type for images')
+    parser.add_argument('--fusion_pe_max_len', default=4096, type=int, help='Max length for fusion 1D position encoding')
+    parser.add_argument('--pe_rows', default=256, type=int, help='Number of rows for learned 2D PE')
+    parser.add_argument('--pe_cols', default=256, type=int, help='Number of columns for learned 2D PE')
 
     return parser.parse_args()
+
 
 
 def build_loaders(args):
@@ -173,7 +185,7 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
     for batch_idx, (imgs, masks, word_id, word_mask, gt_bbox) in enumerate(train_loader):
         imgs = imgs.cuda()
         masks = masks.cuda()
-        masks = (masks[:, :, :, 0] == 255).bool()       # True = padding
+        masks = masks.bool()   # mask đã là (B,H,W) bool từ letterbox
         word_id = word_id.cuda()
         word_mask = word_mask.cuda()
         gt_bbox = gt_bbox.cuda()
@@ -189,16 +201,24 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
             pred_bbox = model(image, masks, word_id, word_mask)
 
         with torch.cuda.amp.autocast(enabled=False):
-            pred_bbox_f = pred_bbox.float()
-            gt_bbox_f = gt_bbox.float()
+            pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
+            gt_bbox_f   = gt_bbox.float()       # xyxy in pixel
 
-            # loss
-            loss = 0.
-            giou = GIoU_Loss(pred_bbox_f * (args.size - 1), gt_bbox_f, args.size - 1)
-            loss += giou
+            # === đổi sang xyxy (pixel) ở ngoài
+            pred_xyxy = torch.cat(
+                [pred_bbox_f[:, :2] - pred_bbox_f[:, 2:] / 2,
+                 pred_bbox_f[:, :2] + pred_bbox_f[:, 2:] / 2],
+                dim=1
+            ) * (args.size - 1)
+
+            # GIoU trên xyxy (pixel)
+            giou = GIoU_Loss(pred_xyxy, gt_bbox_f)
+
+            # L1 trên cxcywh (norm)
             gt_bbox_xywh = xyxy2xywh(gt_bbox_f)
             l1 = Reg_Loss(pred_bbox_f, gt_bbox_xywh / (args.size - 1))
-            loss += l1
+
+            loss = giou + l1
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -209,9 +229,8 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
         l1_losses.update(l1.item(), imgs.size(0))
         GIoU_losses.update(giou.item(), imgs.size(0))
 
-        # metrics
-        pred_xyxy = torch.cat([pred_bbox_f[:, :2] - (pred_bbox_f[:, 2:] / 2),
-                               pred_bbox_f[:, :2] + (pred_bbox_f[:, 2:] / 2)], dim=1) * (args.size - 1)
+        # metrics (dùng lại pred_xyxy đã tính ở trên)
+        pred_xyxy = pred_xyxy
         iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
         cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
         cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))
@@ -258,7 +277,7 @@ def validate_epoch(val_loader, model, args):
     for batch_idx, (imgs, masks, word_id, word_mask, bbox) in enumerate(val_loader):
         imgs = imgs.cuda()
         masks = masks.cuda()
-        masks = (masks[:, :, :, 0] == 255).bool()      # True = padding
+        masks = masks.bool()   # mask đã là (B,H,W) bool từ letterbox
         word_id = word_id.cuda()
         word_mask = word_mask.cuda()
         bbox = bbox.cuda()
@@ -274,20 +293,29 @@ def validate_epoch(val_loader, model, args):
             pred_bbox = model(image, masks, word_id, word_mask)
 
         with torch.cuda.amp.autocast(enabled=False):
-            pred_bbox_f = pred_bbox.float()
-            gt_bbox_f = gt_bbox.float()
+            pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
+            gt_bbox_f   = gt_bbox.float()       # xyxy in pixel
 
-            # loss (để theo dõi)
-            loss = 0.
-            giou = GIoU_Loss(pred_bbox_f * (args.size - 1), gt_bbox_f, args.size - 1); loss += giou
+            # === đổi sang xyxy (pixel) ở ngoài
+            pred_xyxy_for_loss = torch.cat(
+                [pred_bbox_f[:, :2] - pred_bbox_f[:, 2:] / 2,
+                 pred_bbox_f[:, :2] + pred_bbox_f[:, 2:] / 2],
+                dim=1
+            ) * (args.size - 1)
+
+            # GIoU trên xyxy (pixel)
+            giou = GIoU_Loss(pred_xyxy_for_loss, gt_bbox_f)
+
+            # L1 trên cxcywh (norm)
             gt_bbox_xywh = xyxy2xywh(gt_bbox_f)
-            l1 = Reg_Loss(pred_bbox_f, gt_bbox_xywh / (args.size - 1)); loss += l1
+            l1 = Reg_Loss(pred_bbox_f, gt_bbox_xywh / (args.size - 1))
+
+            loss = giou + l1
 
             losses.update(loss.item(), imgs.size(0)); l1_losses.update(l1.item(), imgs.size(0)); GIoU_losses.update(giou.item(), imgs.size(0))
 
-            # metrics
-            pred_xyxy = torch.cat([pred_bbox_f[:, :2] - (pred_bbox_f[:, 2:] / 2),
-                                   pred_bbox_f[:, :2] + (pred_bbox_f[:, 2:] / 2)], dim=1) * (args.size - 1)
+            # metrics (dùng lại pred_xyxy đã tính ở trên)
+            pred_xyxy = pred_xyxy_for_loss
             iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
             cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
             cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))

@@ -1,14 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-"""
-MLCM model and criterion classes.
-@ Author: ZhanYang
-@ File Name: data_loader.py
-@ Email: zhanyang@mail.nwpu.edu.cn
-@ Github: https://github.com/ZhanYang-nwpu/RSVG-pytorch
-@ Paper: https://ieeexplore.ieee.org/document/10056343
-@ Dataset: https://drive.google.com/drive/folders/1hTqtYsC6B-m4ED2ewx5oKuYZV13EoJp_?usp=sharing
-"""
-
+#CNN_MGVLF.py
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -23,7 +13,7 @@ from models.position_encoding import build_position_encoding
 
 class CNN_MGVLF(nn.Module):
     """ This is the MLCM module """
-    def __init__(self, backbone, transformer, DE, position_encoding):
+    def __init__(self, backbone, transformer, DE, position_encoding, max_query_len: int = 40):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -37,14 +27,41 @@ class CNN_MGVLF(nn.Module):
         self.DE = DE
         hidden_dim = transformer.d_model
         self.pos = position_encoding
-        self.text_pos_embed = nn.Embedding(40 + 1, hidden_dim)
 
-        self.conv6_1 = nn.Conv2d(in_channels=2048, out_channels=128, kernel_size=1, stride=1)
-        self.conv6_2 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=2)
-        self.conv7_1 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=1, stride=1)
-        self.conv7_2 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=2)
-        self.conv8_1 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=1, stride=1)
-        self.conv8_2 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=2)
+        # không hard-code 41 nữa
+        self.max_query_len = int(max_query_len)
+        self.text_pos_embed = nn.Embedding(self.max_query_len + 1, hidden_dim)
+
+        self.conv6_1 = nn.Sequential(
+            nn.Conv2d(2048, 128, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.conv6_2 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.conv7_1 = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.conv7_2 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.conv8_1 = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.conv8_2 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
 
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.l_proj = torch.nn.Sequential(nn.Linear(768, hidden_dim), nn.ReLU(), )
@@ -109,7 +126,9 @@ class CNN_MGVLF(nn.Module):
         vis_mask = torch.cat((vis_mask, fv4_mask.view(bs, -1)), dim=1)
         fvl_mask = torch.cat((vis_mask, text_mask), dim=1)
 
-        flpos = self.text_pos_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        # thay vì: flpos = self.text_pos_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        Nt = wordFeature.size(1)  # số word tokens (thường = max_query_len sau pad)
+        flpos = self.text_pos_embed.weight[:Nt+1].unsqueeze(1).repeat(1, bs, 1)  # (Nt+1, B, C)
         fvpos = torch.cat((fvpos1, fvpos2), dim=2)
         fvpos = torch.cat((fvpos, fvpos3), dim=2)
         fvpos = torch.cat((fvpos, fvpos4), dim=2)
@@ -151,37 +170,39 @@ class VLFusion(nn.Module):
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
         """
-        bs, c, h, w = fv.shape
-        _, _, l = fl.shape
+        B, C, H, W = fv.shape
+        _, L, _    = fl.shape
 
-        pv = self.v_proj(fv.view(bs, c, -1).permute(0,2,1))
-        pl = self.l_proj(fl)
-        pv = pv.permute(0,2,1)
-        pl = pl.permute(0,2,1)
+        # (1) Visual tokens: (B, 256, H*W)
+        pv = fv.view(B, C, -1)                  # (B,256,Lv)
+        pv = self.v_proj(pv.transpose(1, 2)).transpose(1, 2)  # Linear->(B,Lv,256)->(B,256,Lv)
 
-        pr = self.pr.weight
-        pr = pr.expand(bs,-1).unsqueeze(2)
+        # (2) Word tokens: (B, 256, L)
+        pl = self.l_proj(fl).transpose(1, 2)    # (B,256,L)
 
-        x0 = torch.cat((pv, pl), dim=2)
-        x0 = torch.cat((x0, pr), dim=2)
-        
-        pos = self.pos(x0).to(x0.dtype)
+        # (3) Learnable pr token: (B,256,1)
+        pr = self.pr.weight.unsqueeze(0).expand(B, -1).unsqueeze(2)  # (B,256,1)
 
-        # Tạo padding mask (True = padding) cho chuỗi hợp nhất [vis | text | pr]
-        # - Ảnh (pv): không padding -> toàn False
-        # - Text (pl): dùng word_mask từ BERT (1=real, 0=pad) => đảo để True=pad
-        # - pr token: không padding -> False
+        # (4) Chuỗi fusion: src=(B,256,S)
+        x0 = torch.cat((pv, pl, pr), dim=2)     # (B,256,S) với S = Lv + L + 1
+
+        # (5) Positional encoding 1D cho chuỗi: pos=(B,S,256)
+        # self.pos là learned-1D PE (đã set ở build_VLFusion)
+        pos = self.pos(x0.transpose(1, 2)).to(x0.dtype)  # (B,S,256)
+
+        # (6) Padding mask: True=padding theo từng đoạn [vis | text | pr]
+        Lv = pv.shape[2]
         if word_mask is not None:
-            # word_mask shape: (B, L_text) với 1=token thật, 0=pad
-            text_pad = (~word_mask.bool()).to(x0.device)              # (B, L_text), True ở vị trí pad
+            # word_mask: 1=real, 0=pad  ->  True=pad
+            text_pad = (~word_mask.bool()).to(x0.device)   # (B,L)
         else:
-            text_pad = torch.zeros((bs, pl.shape[2]), dtype=torch.bool, device=x0.device)
+            text_pad = torch.zeros((B, L), dtype=torch.bool, device=x0.device)
 
-        vis_pad = torch.zeros((bs, pv.shape[2]), dtype=torch.bool, device=x0.device)
-        pr_pad  = torch.zeros((bs, 1),            dtype=torch.bool, device=x0.device)
+        vis_pad = torch.zeros((B, Lv), dtype=torch.bool, device=x0.device)
+        pr_pad  = torch.zeros((B, 1),  dtype=torch.bool, device=x0.device)
+        mask = torch.cat([vis_pad, text_pad, pr_pad], dim=1)   # (B,S), True=pad
 
-        mask = torch.cat([vis_pad, text_pad, pr_pad], dim=1)          # (B, L_total), True=padding
-
+        # (7) Transformer fusion: expects src=(B,C,S), pos=(B,S,C), mask=(B,S)
         out = self.transformer(x0, mask, pos)
         return out[-1]
 
@@ -195,21 +216,19 @@ def build_CNN_MGVLF(args):
     pos = build_position_encoding(args, position_embedding='sine')
 
     model = CNN_MGVLF(
-        backbone,
-        EN,
-        DE,
-        pos,
+        backbone=backbone,
+        transformer=EN,
+        DE=DE,
+        position_encoding=pos,
+        max_query_len=getattr(args, "time", 40),  # dùng --time từ main.py
     )
     return model
 
 
 def build_VLFusion(args):
-    device = torch.device(args.device)
     transformer = build_transformer(args)
-    pos = build_position_encoding(args, position_embedding = 'learned')
-    model = VLFusion(
-        transformer,
-        pos,
-    )
+    # DÙNG PE 1D cho chuỗi fusion, không dùng PE ảnh 2D:
+    pos = build_position_encoding(args, position_embedding='learned1d')
+    model = VLFusion(transformer, pos)
     return model
 

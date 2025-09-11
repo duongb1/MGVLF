@@ -11,8 +11,8 @@ from utils.misc import NestedTensor
 
 class PositionEmbeddingSine(nn.Module):
     """
-    This is a more standard version of the position embedding, very similar to the one
-    used by the Attention is all you need paper, generalized to work on images.
+    Sine/cosine 2D PE cho ảnh, giống 'Attention is All You Need' mở rộng cho hình ảnh.
+    Trả về (B, C, H, W).
     """
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
         super().__init__()
@@ -48,41 +48,73 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
 
-class PositionEmbeddingLearned(nn.Module):
+class PositionEmbeddingLearned1D(nn.Module):
     """
-    Absolute pos embedding, learned.
+    Learned 1D positional embedding cho CHUỖI (fusion) – dùng cho [vis | word | pr].
+    Nhận x dạng (B,C,S) hoặc (B,S,C), trả về pos dạng (B,S,C).
     """
-    def __init__(self, num_pos_feats=256):
+    def __init__(self, num_pos_feats=256, max_len=2048):
         super().__init__()
-        self.col_embed = nn.Embedding(441, num_pos_feats)
-        self.reset_parameters()
+        self.embed = nn.Embedding(max_len, num_pos_feats)
+        nn.init.uniform_(self.embed.weight)
 
-    def reset_parameters(self):
+    def forward(self, x: torch.Tensor):
+        if x.dim() != 3:
+            raise ValueError("Expect (B,C,S) hoặc (B,S,C) cho learned1d PE")
+        B = x.size(0)
+        C = self.embed.embedding_dim  # 256 mặc định
+
+        # Suy luận S an toàn theo kích thước ẩn C
+        if x.shape[-1] == C:   # (B, S, C)
+            S = x.shape[1]
+        elif x.shape[1] == C:  # (B, C, S)
+            S = x.shape[2]
+        else:
+            # fallback: coi chiều cuối là S
+            S = x.shape[-1]
+
+        S = min(S, self.embed.num_embeddings)
+        pos = self.embed(torch.arange(S, device=x.device))  # (S, C)
+        return pos.unsqueeze(0).expand(B, S, -1)            # (B, S, C)
+
+
+class PositionEmbeddingLearned2D(nn.Module):
+    """
+    Learned 2D positional embedding cho ẢNH. pos(x,y) = row_embed[y] + col_embed[x]
+    Trả về (B, C, H, W).
+    """
+    def __init__(self, num_pos_feats=256, num_rows=256, num_cols=256):
+        super().__init__()
+        self.row_embed = nn.Embedding(num_rows, num_pos_feats)
+        self.col_embed = nn.Embedding(num_cols, num_pos_feats)
+        nn.init.uniform_(self.row_embed.weight)
         nn.init.uniform_(self.col_embed.weight)
 
     def forward(self, tensor_list: NestedTensor):
-        # x = tensor_list.tensors
-        x = tensor_list
-        # h, w = x.shape[-2:]
-        w = x.shape[-1]
-        i = torch.arange(w, device=x.device)
-        # j = torch.arange(h, device=x.device)
-        x_emb = self.col_embed(i)
-        # y_emb = self.row_embed(j)
-        pos = x_emb.unsqueeze(0).repeat(x.shape[0], 1, 1)
-        return pos
+        x = tensor_list.tensors  # (B, C, H, W)
+        H, W = x.shape[-2], x.shape[-1]
+        i = torch.arange(W, device=x.device).clamp(max=self.col_embed.num_embeddings - 1)
+        j = torch.arange(H, device=x.device).clamp(max=self.row_embed.num_embeddings - 1)
+        x_emb = self.col_embed(i)  # (W, C)
+        y_emb = self.row_embed(j)  # (H, C)
+        pos = y_emb[:, None, :] + x_emb[None, :, :]  # (H, W, C)
+        return pos.permute(2, 0, 1).unsqueeze(0).expand(x.size(0), -1, -1, -1)  # (B, C, H, W)
 
 
 def build_position_encoding(args, position_embedding):
-    N_steps = args.hidden_dim // 2
     if position_embedding in ('v2', 'sine'):
-        # TODO find a better way of exposing other arguments
-        position_embedding = PositionEmbeddingSine(N_steps, normalize=True)
-    elif position_embedding in ('v3', 'learned'):
-        N_steps = 256
-        position_embedding = PositionEmbeddingLearned(N_steps)
+        N_steps = args.hidden_dim // 2
+        return PositionEmbeddingSine(N_steps, normalize=True)
+    elif position_embedding in ('learned2d', 'learned', 'v3'):
+        return PositionEmbeddingLearned2D(
+            num_pos_feats=args.hidden_dim,
+            num_rows=getattr(args, 'pe_rows', 256),
+            num_cols=getattr(args, 'pe_cols', 256),
+        )
+    elif position_embedding in ('learned1d', 'fusion1d'):
+        return PositionEmbeddingLearned1D(
+            num_pos_feats=args.hidden_dim,
+            max_len=getattr(args, 'fusion_pe_max_len', 4096),
+        )
     else:
         raise ValueError(f"not supported {position_embedding}")
-
-    return position_embedding
-

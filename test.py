@@ -47,6 +47,12 @@ def parse_args():
     parser.add_argument('--nheads', default=8, type=int)
     parser.add_argument('--num_queries', default=400 + 40 + 1, type=int)
     parser.add_argument('--pre_norm', action='store_true')
+    
+    # ===== Position Encoding Configuration =====
+    parser.add_argument('--img_pe_type', default='sine', choices=['sine','learned2d'], help='Position encoding type for images')
+    parser.add_argument('--fusion_pe_max_len', default=4096, type=int, help='Max length for fusion 1D position encoding')
+    parser.add_argument('--pe_rows', default=256, type=int, help='Number of rows for learned 2D PE')
+    parser.add_argument('--pe_cols', default=256, type=int, help='Number of columns for learned 2D PE')
     return parser.parse_args()
 
 
@@ -78,7 +84,7 @@ def test_epoch(test_loader, model, args):
     for batch_idx, (imgs, masks, word_id, word_mask, bbox, ratio, dw, dh, im_id, phrase) in enumerate(test_loader):
         imgs = imgs.cuda()
         masks = masks.cuda()
-        masks = (masks[:, :, :, 0] == 255).bool()   # True = padding
+        masks = masks.bool()   # mask đã là (B,H,W) bool từ letterbox
         word_id = word_id.cuda()
         word_mask = word_mask.cuda()
         bbox = bbox.cuda()

@@ -120,20 +120,28 @@ class ToNumpy:
     def __call__(self, x):
         return x.numpy()
 
-def letterbox(img, mask, height, color=(123.7, 116.3, 103.5)):  # resize a rectangular image to a padded square
-    shape = img.shape[:2]  # shape = [height, width]
-    ratio = float(height) / max(shape)  # ratio  = old / new
-    new_shape = (round(shape[1] * ratio), round(shape[0] * ratio))
-    dw = (height - new_shape[0]) / 2  # width padding
-    dh = (height - new_shape[1]) / 2  # height padding
-    top, bottom = round(dh - 0.1), round(dh + 0.1)
-    left, right = round(dw - 0.1), round(dw + 0.1)
-    img = cv2.resize(img, new_shape, interpolation=cv2.INTER_AREA)  # resized, no border
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # padded square
-    if mask is not None:
-        mask = cv2.resize(mask, new_shape, interpolation=cv2.INTER_NEAREST)  # resized, no border
-        mask = cv2.copyMakeBorder(mask, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(255,255,255))  # padded square
-    return img, mask, ratio, dw, dh
+def letterbox(img, mask, height, color=(123.7, 116.3, 103.5)):
+    # img: H×W×3 (RGB), mask: không cần dùng nữa (có thể None)
+    shape = img.shape[:2]                         # (H, W)
+    ratio = float(height) / max(shape)
+    new_w, new_h = round(shape[1]*ratio), round(shape[0]*ratio)
+    dw = (height - new_w) / 2
+    dh = (height - new_h) / 2
+    top, bottom  = round(dh - 0.1), round(dh + 0.1)
+    left, right  = round(dw - 0.1), round(dw + 0.1)
+
+    # resize + pad ảnh
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    img = cv2.copyMakeBorder(img, top, bottom, left, right,
+                             cv2.BORDER_CONSTANT, value=color)
+
+    # mask bool: True = phần đệm
+    base = np.zeros((new_h, new_w), dtype=np.uint8)
+    pad_mask = cv2.copyMakeBorder(base, top, bottom, left, right,
+                                  cv2.BORDER_CONSTANT, value=(1,))     # 1 ở vùng pad
+    mask_bool = pad_mask.astype(bool)                                # (H,W)
+
+    return img, mask_bool, ratio, dw, dh
 
 def random_affine(img, mask, targets, degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-2, 2),
                   borderValue=(123.7, 116.3, 103.5), all_bbox=None):
