@@ -107,15 +107,18 @@ class MGVLF(nn.Module):
 
         # ===== SEED TỪ DETR: KHÔNG DÙNG PARSER, GỌI THẲNG Ở ĐÂY =====
         try:
-            import os
-            ckpt = "./pretrained/detr_resnet50.pth"  # nếu bạn có file local, đặt vào đây
-            if os.path.isfile(ckpt):
-                self.seed_from_detr(ckpt_path=ckpt)          # seed từ file local
-            else:
-                self.seed_from_detr()                         # seed từ torch.hub (online lần đầu)
+            import os, urllib.request
+            os.makedirs("pretrained", exist_ok=True)
+            ckpt = "./pretrained/detr-r50-e632da11.pth"
+            if not os.path.isfile(ckpt):
+                url = "https://dl.fbaipublicfiles.com/detr/detr-r50-e632da11.pth"
+                print(f"[DETR seed] downloading from {url} ...")
+                urllib.request.urlretrieve(url, ckpt)
+            self.seed_from_detr(ckpt_path=ckpt)
             print("[DETR seed] done.")
         except Exception as e:
             print(f"[DETR seed] skipped: {e}")
+
 
         # -------- Localization Head --------
         self.box_head = nn.Sequential(
