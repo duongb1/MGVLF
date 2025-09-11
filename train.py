@@ -8,10 +8,8 @@ import numpy as np
 
 import torch
 import torch.backends.cudnn as cudnn
-import torch.utils.data.distributed
 import torch.optim
 from torch.utils.data import DataLoader
-from torch.autograd import Variable
 import matplotlib as mpl
 mpl.use('Agg')
 
@@ -34,6 +32,8 @@ def parse_args():
     parser.add_argument('--size', default=640, type=int, help='image size')
     parser.add_argument('--images_path', type=str, default='./DIOR_RSVG/JPEGImages')
     parser.add_argument('--anno_path', type=str, default='./DIOR_RSVG/Annotations')
+    parser.add_argument('--splits_dir', type=str, default='./DIOR_RSVG/',
+                        help='thư mục chứa train/val/test.txt')
     parser.add_argument('--time', default=40, type=int, help='max language length')
 
     # ===== Training =====
@@ -86,9 +86,11 @@ def build_loaders(args):
     ])
 
     train_dataset = RSVGDataset(images_path=args.images_path, anno_path=args.anno_path,
-                                split='train', imsize=args.size, transform=input_transform, max_query_len=args.time)
+                                split='train', imsize=args.size, transform=input_transform, 
+                                max_query_len=args.time, splits_dir=args.splits_dir)   # <-- truyền vào
     val_dataset = RSVGDataset(images_path=args.images_path, anno_path=args.anno_path,
-                              split='val', imsize=args.size, transform=input_transform, max_query_len=args.time)
+                              split='val', imsize=args.size, transform=input_transform, 
+                              max_query_len=args.time, splits_dir=args.splits_dir)   # <-- truyền vào
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               pin_memory=True, drop_last=True, num_workers=args.workers)
@@ -101,10 +103,9 @@ def build_loaders(args):
 def build_model(args):
     model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args).cuda()  # ✅ single-GPU
 
-    if args.pretrain:
+    # chỉ load pretrain nếu KHÔNG resume
+    if args.pretrain and not args.resume:
         model = load_pretrain(model, args, logging)
-    if args.resume:
-        model = load_resume(model, args, logging)
 
     num_params = sum(p.nelement() for p in model.parameters())
     print('Num of parameters:', num_params)
@@ -167,6 +168,10 @@ def build_model(args):
     assert all_ids == grouped_ids, \
         f"Param grouping mismatch: all_grad={len(all_ids)} grouped={len(grouped_ids)}"
 
+    # nếu resume: nạp cả optimizer + epoch
+    if args.resume:
+        model, optimizer = load_resume(model, args, logging, optimizer)
+
     return model, optimizer
 
 
@@ -189,16 +194,11 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
         word_id = word_id.cuda()
         word_mask = word_mask.cuda()
         gt_bbox = gt_bbox.cuda()
-        image = Variable(imgs)
-        masks = Variable(masks)
-        word_id = Variable(word_id)
-        word_mask = Variable(word_mask)
-        gt_bbox = Variable(gt_bbox)
         gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
         # ====== AMP: forward dưới autocast (model fp16/bf16), loss ở fp32 ======
         with autocast(dtype=torch.float16):
-            pred_bbox = model(image, masks, word_id, word_mask)
+            pred_bbox = model(imgs, masks, word_id, word_mask)
 
         with torch.cuda.amp.autocast(enabled=False):
             pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
@@ -210,6 +210,7 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
                  pred_bbox_f[:, :2] + pred_bbox_f[:, 2:] / 2],
                 dim=1
             ) * (args.size - 1)
+            pred_xyxy = pred_xyxy.clamp(min=0, max=args.size - 1)
 
             # GIoU trên xyxy (pixel)
             giou = GIoU_Loss(pred_xyxy, gt_bbox_f)
@@ -282,15 +283,12 @@ def validate_epoch(val_loader, model, args):
         word_mask = word_mask.cuda()
         bbox = bbox.cuda()
 
-        image = Variable(imgs); masks = Variable(masks)
-        word_id = Variable(word_id); word_mask = Variable(word_mask)
-        bbox = Variable(bbox)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
         gt_bbox = bbox
 
         # ====== AMP: chỉ forward ở autocast, còn lại fp32 ======
         with autocast(dtype=torch.float16):
-            pred_bbox = model(image, masks, word_id, word_mask)
+            pred_bbox = model(imgs, masks, word_id, word_mask)
 
         with torch.cuda.amp.autocast(enabled=False):
             pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
@@ -302,6 +300,7 @@ def validate_epoch(val_loader, model, args):
                  pred_bbox_f[:, :2] + pred_bbox_f[:, 2:] / 2],
                 dim=1
             ) * (args.size - 1)
+            pred_xyxy_for_loss = pred_xyxy_for_loss.clamp(min=0, max=args.size - 1)
 
             # GIoU trên xyxy (pixel)
             giou = GIoU_Loss(pred_xyxy_for_loss, gt_bbox_f)
@@ -380,8 +379,11 @@ def main():
     scaler = GradScaler()
 
     # train loop
-    best_accu = -float('Inf')
-    for epoch in range(args.nb_epoch):
+    if not hasattr(args, "start_epoch"):
+        args.start_epoch = 0
+
+    best_accu = -float('Inf')   # (tuỳ chọn) có thể đọc lại từ checkpoint nếu bạn lưu
+    for epoch in range(args.start_epoch, args.nb_epoch):
         adjust_learning_rate(args, optimizer, epoch)
         _ = train_epoch(train_loader, model, optimizer, epoch, args, scaler)
         v_metrics = validate_epoch(val_loader, model, args)
@@ -392,7 +394,7 @@ def main():
         save_checkpoint({
             'epoch': epoch + 1,
             'state_dict': model.state_dict(),
-            'best_loss': acc_new,
+            'best_metric': acc_new,                 # đổi tên khóa cho đúng
             'optimizer': optimizer.state_dict(),
         }, is_best, args, filename=args.savename)
 

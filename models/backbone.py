@@ -11,6 +11,19 @@ from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
 
+# Dùng dynamic import để tránh lỗi type checking
+def get_resnet_weights():
+    try:
+        from torchvision.models import ResNet18_Weights, ResNet34_Weights, ResNet50_Weights, ResNet101_Weights
+        return {
+            'resnet18':  ResNet18_Weights.IMAGENET1K_V1,
+            'resnet34':  ResNet34_Weights.IMAGENET1K_V1,
+            'resnet50':  ResNet50_Weights.IMAGENET1K_V2,
+            'resnet101': ResNet101_Weights.IMAGENET1K_V2,
+        }
+    except ImportError:
+        return None
+
 from utils.misc import NestedTensor
 
 from .position_encoding import build_position_encoding
@@ -86,9 +99,26 @@ class Backbone(BackboneBase):
                  train_backbone: bool,
                  return_interm_layers: bool,
                  dilation: bool):
-        backbone = getattr(torchvision.models, name)(
-            replace_stride_with_dilation=[False, False, dilation],
-            pretrained=True, norm_layer=FrozenBatchNorm2d)
+        ctor = getattr(torchvision.models, name)
+        
+        # Thử dùng weights API mới trước, fallback sang pretrained=True
+        weights_map = get_resnet_weights()
+        
+        try:
+            if weights_map is not None:
+                backbone = ctor(
+                    weights=weights_map.get(name, None),
+                    replace_stride_with_dilation=[False, False, dilation],
+                    norm_layer=FrozenBatchNorm2d
+                )
+            else:
+                raise TypeError("Fallback to old API")
+        except (TypeError, AttributeError):
+            # Fallback cho torchvision cũ
+            backbone = ctor(
+                replace_stride_with_dilation=[False, False, dilation],
+                pretrained=True, norm_layer=FrozenBatchNorm2d)
+        
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
@@ -110,7 +140,9 @@ class Joiner(nn.Sequential):
 
 
 def build_backbone(args):
-    position_embedding = build_position_encoding(args, position_embedding='sine')
+    position_embedding = build_position_encoding(
+        args, position_embedding=getattr(args, 'img_pe_type', 'sine')
+    )
     train_backbone = args.lr > 0
     return_interm_layers = args.masks
     return_interm_layers = True

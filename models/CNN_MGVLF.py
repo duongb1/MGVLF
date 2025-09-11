@@ -213,7 +213,7 @@ def build_CNN_MGVLF(args):
     backbone = build_backbone(args) # ResNet 50
     EN = build_vis_transformer(args)
     DE = build_de(args)
-    pos = build_position_encoding(args, position_embedding='sine')
+    pos = build_position_encoding(args, position_embedding=getattr(args, 'img_pe_type', 'sine'))
 
     model = CNN_MGVLF(
         backbone=backbone,

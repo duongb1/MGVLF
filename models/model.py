@@ -1,5 +1,6 @@
 # models/model.py
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -9,7 +10,7 @@ from models.CNN_MGVLF import build_VLFusion, build_CNN_MGVLF
 from transformers import AutoModel, AutoConfig
 
 
-def load_weights(model, load_path):
+def load_weights(model: nn.Module, load_path: str) -> nn.Module:
     """
     Nạp trọng số linh hoạt từ nhiều định dạng checkpoint:
     - {'model': state_dict} hoặc {'state_dict': state_dict} hoặc state_dict thuần.
@@ -28,12 +29,24 @@ def load_weights(model, load_path):
 
 
 class MGVLF(nn.Module):
-    def __init__(self, bert_model='bert-base-uncased', tunebert=True, args=None):
+    """
+    Implementation đúng theo pipeline của paper RSVG/MGVLF:
+
+      Text encoder (BERT, lấy word-level + 1 sentence) →
+      CNN_MGVLF (DE: refine fv1 bằng [multi-scale vis + word + sentence]) →
+      VLFusion (encoder với [word-level tokens + 1 learnable token]) →
+      Box head (cx,cy,w,h) ∈ [0,1]
+
+    Lưu ý: Không dùng WLP/FiLM/Quality head để khớp paper gốc.
+    """
+    def __init__(self, bert_model: str = 'bert-base-uncased', tunebert: bool = True, args: Optional[object] = None):
         super(MGVLF, self).__init__()
         self.tunebert = tunebert
         self.args = args
 
         # -------- Text model (HF Transformers) --------
+        # output_hidden_states không bắt buộc khi dùng last_hidden_state,
+        # vẫn bật để tương thích nếu cần debug.
         config = AutoConfig.from_pretrained(
             bert_model,
             output_hidden_states=True,
@@ -41,43 +54,28 @@ class MGVLF(nn.Module):
         )
         self.textmodel = AutoModel.from_pretrained(bert_model, config=config)
 
-        # If not fine-tuning BERT, freeze to save compute
+        # Nếu không fine-tune BERT, freeze toàn bộ tham số để tiết kiệm compute
         if not self.tunebert:
             for p in self.textmodel.parameters():
                 p.requires_grad = False
-
-        # ===== (1) Weighted Layer Pooling (WLP) cho 4 lớp cuối của BERT =====
-        self.wlp_weights = nn.Parameter(torch.ones(4) / 4)
 
         # -------- Visual model (CNN branch của MGVLF) --------
         self.visumodel = build_CNN_MGVLF(args)
         if args is not None and getattr(args, "pretrain", ""):
             self.visumodel = load_weights(self.visumodel, args.pretrain)
 
-        # ===== (2) LVFE-lite: FiLM gating bằng sentence_feature =====
-        # Áp dụng ngoài visumodel cho an toàn tương thích: nếu fv là (B,256,H,W) → FiLM theo không gian;
-        # nếu fv đã là token (B,N,256) → FiLM theo token.
-        self.film_gamma = nn.Linear(768, 256)
-        self.film_beta  = nn.Linear(768, 256)
-
         # -------- Multimodal Fusion model --------
         self.vlmodel = build_VLFusion(args)
         if args is not None and getattr(args, "pretrain", ""):
             self.vlmodel = load_weights(self.vlmodel, args.pretrain)
 
-        # -------- Localization Heads --------
-        # Box head (thay thế Prediction_Head cũ) + Quality head (q̂≈IoU)
+        # -------- Localization Head --------
         self.box_head = nn.Sequential(
             nn.Linear(256, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 4),
         )
-        self.quality_head = nn.Sequential(
-            nn.Linear(256, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, 1), nn.Sigmoid()
-        )
-
-        # Giữ alias để không phá code cũ (nếu nơi khác tham chiếu Prediction_Head)
+        # Alias giữ tương thích nếu ở nơi khác tham chiếu Prediction_Head
         self.Prediction_Head = self.box_head
 
         for m in self.box_head.modules():
@@ -85,61 +83,18 @@ class MGVLF(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        for m in self.quality_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        # Tuỳ chọn: số retrieval tokens ở cuối chuỗi từ vlmodel (nếu vlmodel đã hỗ trợ)
-        # Nếu không, logic bên dưới vẫn an toàn (lấy token cuối).
-        self.num_retrieval = getattr(args, 'num_retrieval', 1) if args is not None else 1
-
-        # nơi tạm giữ phụ trợ cho loss ngoài (không ảnh hưởng API)
-        self._last_qhat = None
-
-    @staticmethod
-    def _weighted_layer_pool(last4, w):
-        """last4: (4,B,L,H), w: learnable weights len=4 → (B,L,H)"""
-        w = torch.softmax(w, dim=0).view(4, 1, 1, 1)
-        return (last4 * w).sum(0)
-
-    def _apply_film(self, fv, sentence_feature):
-        """Áp dụng FiLM-lite vào đặc trưng thị giác fv dựa trên câu.
-        - Nếu fv (B,256,H,W): nhân/phép cộng theo không gian.
-        - Nếu fv (B,N,256): áp dụng theo token.
-        - Nếu dạng khác → trả nguyên vẹn.
-        """
-        gamma = torch.tanh(self.film_gamma(sentence_feature))  # (B,256)
-        beta  = self.film_beta(sentence_feature)               # (B,256)
-
-        if fv is None:
-            return None
-        if fv.dim() == 4 and fv.size(1) == 256:  # (B,256,H,W)
-            B, C, H, W = fv.shape
-            g = gamma.view(B, C, 1, 1)
-            b = beta.view(B, C, 1, 1)
-            return fv * (1 + g) + b
-        elif fv.dim() == 3 and fv.size(-1) == 256:  # (B,N,256)
-            B, N, C = fv.shape
-            g = gamma.view(B, 1, C)
-            b = beta.view(B, 1, C)
-            return fv * (1 + g) + b
-        else:
-            # không nhận diện được, trả nguyên
-            return fv
 
     def forward(self, image, mask, word_id, word_mask, return_aux: bool = False):
         """
         Inputs:
-            image: (B, 3, H, W) tensor (đã ToTensor + Normalize)
-            mask:  (B, H, W) bool, True = padding (chuẩn DETR)
+            image:     (B, 3, H, W) tensor (đã ToTensor + Normalize)
+            mask:      (B, H, W) bool, True = padding (chuẩn DETR)
             word_id:   (B, L) input_ids (có thể là np.array)
             word_mask: (B, L) attention_mask (1=token thật, 0=pad; có thể là np.array)
-            return_aux: nếu True, trả thêm qhat để tính quality loss ở ngoài.
+            return_aux: giữ cho tương thích (không dùng trong paper)
+
         Output:
             outbox: (B, 4) bbox normalized [0,1] in format (cx, cy, w, h)
-            (tuỳ chọn) aux: { 'qhat': (B,1) }
         """
         # Đưa word_id/word_mask về LongTensor đúng device
         if not torch.is_tensor(word_id):
@@ -158,65 +113,46 @@ class MGVLF(nn.Module):
             attention_mask=word_mask,
             return_dict=True
         )
-        hidden_states = outputs.hidden_states  # tuple of (B, L, H)
+        # Word-level tokens
+        fl = outputs.last_hidden_state  # (B, L, H=768)
 
-        # WLP thay vì avg cứng 4 lớp cuối
-        last4 = torch.stack(hidden_states[-4:], dim=0)  # (4,B,L,H)
-        fl = self._weighted_layer_pool(last4, self.wlp_weights)  # (B,L,H)
-
-        # Câu (pooler) – nếu checkpoint không có pooler, dùng mean-pool theo mask
+        # Sentence-level feature: ưu tiên pooler_output, fallback mean-pool theo mask
         sentence_feature = getattr(outputs, "pooler_output", None)
         if sentence_feature is None:
             am = word_mask.unsqueeze(-1).float()             # (B, L, 1)
-            sentence_feature = (fl * am).sum(dim=1) / am.sum(dim=1).clamp_min(1.0)  # (B, H)
+            sentence_feature = (fl * am).sum(dim=1) / am.sum(dim=1).clamp_min(1.0)  # (B, 768)
 
         if not self.tunebert:
             # nếu đã tắt grad, detach cho chắc (tránh backprop qua BERT)
             fl = fl.detach()
             sentence_feature = sentence_feature.detach()
 
-        # -------- 2) Visual encoder (CNN MGVLF branch) --------
+        # -------- 2) Visual encoder (CNN_MGVLF branch) --------
         # mask ảnh ở đây là True=padding (đúng quy ước DETR)
-        fv = self.visumodel(image, mask, word_mask, fl, sentence_feature)
-
-        # (FiLM-lite) tăng cường fv theo câu, an toàn với nhiều dạng shape fv
-        fv = self._apply_film(fv, sentence_feature)
+        fv = self.visumodel(image, mask, word_mask, fl, sentence_feature)  # (B, 256, H', W')
 
         # -------- 3) Fusion encoder --------
-        # VLFusion đã được sửa để nhận word_mask (attention_mask) và tự tạo pad mask True=padding
-        try:
-            x = self.vlmodel(fv, fl, word_mask)  # phiên bản mới đã nhận word_mask
-        except TypeError:
-            # fallback nếu VLFusion cũ chưa thêm word_mask
-            x = self.vlmodel(fv, fl)
+        # VLFusion: chỉ ghép word-level + 1 learnable token (pr), không đưa sentence vào fusion.
+        x = self.vlmodel(fv, fl, word_mask)  # thường trả (B, 256)
 
-        # -------- 4) Lấy đặc trưng truy hồi từ đầu ra Fusion --------
-        # Hỗ trợ các khả năng: (B,256,L) hoặc (B,L,256) hoặc vector (B,256).
-        # Nếu self.num_retrieval>1 và vlmodel sắp xếp K token cuối là retrieval tokens,
-        # ta sẽ mean-pool các token cuối; nếu không, lấy token cuối như cũ.
-        if x.dim() == 3:
-            B = x.size(0)
-            if x.size(1) == 256:      # (B, 256, L)
-                L = x.size(2)
-                K = min(self.num_retrieval, L)
-                feat = x[:, :, -K:]           # (B,256,K)
-                feat = feat.mean(dim=2)       # (B,256)
-            elif x.size(2) == 256:    # (B, L, 256)
-                L = x.size(1)
-                K = min(self.num_retrieval, L)
-                feat = x[:, -K:, :].mean(dim=1)  # (B,256)
+        # -------- 4) Lấy đặc trưng cho head --------
+        if x.dim() == 2 and x.size(1) == 256:
+            feat = x  # (B,256)
+        elif x.dim() == 3:
+            # mềm dẻo nếu transformer trả (B,256,L) hoặc (B,L,256)
+            if x.size(1) == 256:      # (B,256,L) → lấy token cuối
+                feat = x[:, :, -1]
+            elif x.size(2) == 256:    # (B,L,256) → lấy token cuối
+                feat = x[:, -1, :]
             else:
                 raise RuntimeError(f"Unexpected fusion output shape {x.shape}")
-        elif x.dim() == 2 and x.size(1) == 256:
-            feat = x  # (B,256)
         else:
             raise RuntimeError(f"Unsupported fusion output shape {x.shape}")
 
-        # -------- 5) Heads --------
+        # -------- 5) Head --------
         outbox = self.box_head(feat).sigmoid()  # (B,4) in [0,1]
-        qhat = self.quality_head(feat)          # (B,1) in [0,1]
-        self._last_qhat = qhat
 
+        # paper không dùng aux; giữ cờ để tương thích
         if return_aux:
-            return outbox, {"qhat": qhat}
+            return outbox, {}
         return outbox

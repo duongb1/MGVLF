@@ -10,7 +10,6 @@ import cv2
 
 import torch
 from torch.utils.data import DataLoader
-from torch.autograd import Variable
 from torchvision.transforms import Compose, ToTensor, Normalize
 
 from data_loader import RSVGDataset
@@ -24,6 +23,8 @@ def parse_args():
     parser.add_argument('--size', default=640, type=int, help='image size')
     parser.add_argument('--images_path', type=str, default='./DIOR_RSVG/JPEGImages')
     parser.add_argument('--anno_path', type=str, default='./DIOR_RSVG/Annotations')
+    parser.add_argument('--splits_dir', type=str, default='./DIOR_RSVG/',
+                        help='thư mục chứa train/val/test.txt')
     parser.add_argument('--time', default=40, type=int, help='max language length')
     parser.add_argument('--gpu', default='0', help='gpu id')
     parser.add_argument('--workers', default=0, type=int)
@@ -65,7 +66,8 @@ def build_loader(args):
 
     test_dataset = RSVGDataset(images_path=args.images_path, anno_path=args.anno_path,
                                split='test', testmode=True, imsize=args.size,
-                               transform=input_transform, max_query_len=args.time)
+                               transform=input_transform, max_query_len=args.time, 
+                               splits_dir=args.splits_dir)   # <-- truyền vào
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
                              pin_memory=True, drop_last=True, num_workers=args.workers)
     print('testset:', len(test_dataset))
@@ -88,13 +90,9 @@ def test_epoch(test_loader, model, args):
         word_id = word_id.cuda()
         word_mask = word_mask.cuda()
         bbox = bbox.cuda()
-
-        image = Variable(imgs); masks = Variable(masks)
-        word_id = Variable(word_id); word_mask = Variable(word_mask)
-        bbox = Variable(bbox)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(image, masks, word_id, word_mask)
+        pred_bbox = model(imgs, masks, word_id, word_mask)
         pred_bbox = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
                                pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1)
         pred_bbox = pred_bbox * (args.size - 1)
@@ -115,12 +113,12 @@ def test_epoch(test_loader, model, args):
         ratio_scalar = float(ratio)
         new_shape = (round(img_np.shape[1] / ratio_scalar), round(img_np.shape[0] / ratio_scalar))
         img_np = cv2.resize(img_np, new_shape, interpolation=cv2.INTER_CUBIC)
-        img_np = Variable(torch.from_numpy(img_np.transpose(2, 0, 1)).cuda().unsqueeze(0))
+        img_tensor = torch.from_numpy(img_np.transpose(2, 0, 1)).cuda().unsqueeze(0)
 
         pred_bbox[:, :2], pred_bbox[:, 2], pred_bbox[:, 3] = \
             torch.clamp(pred_bbox[:, :2], min=0), \
-            torch.clamp(pred_bbox[:, 2], max=img_np.shape[3]), \
-            torch.clamp(pred_bbox[:, 3], max=img_np.shape[2])
+            torch.clamp(pred_bbox[:, 2], max=img_tensor.shape[3]), \
+            torch.clamp(pred_bbox[:, 3], max=img_tensor.shape[2])
         target_bbox[:, :2], target_bbox[:, 2], target_bbox[:, 3] = \
             torch.clamp(target_bbox[:, :2], min=0), \
             torch.clamp(target_bbox[:, 2], max=img_np.shape[3]), \
@@ -178,7 +176,7 @@ def main():
     model = MGVLF(bert_model=args.bert_model, tunebert=True, args=args).cuda()
 
     if args.resume:
-        model = load_resume(model, args, logging)
+        model, _ = load_resume(model, args, logging)  # không cần optimizer khi test
     else:
         raise ValueError("--resume (checkpoint) is required for testing.")
 

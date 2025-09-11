@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 def Reg_Loss(output, target):
     sm_l1_loss = torch.nn.SmoothL1Loss(reduction='mean')
