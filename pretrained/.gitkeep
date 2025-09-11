@@ -1,0 +1,3 @@
+# Placeholder file to keep this directory in git
+# You can place DETR checkpoint file here:
+# - detr_resnet50.pth

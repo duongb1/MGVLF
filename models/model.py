@@ -10,6 +10,42 @@ from models.CNN_MGVLF import build_VLFusion, build_CNN_MGVLF
 from transformers import AutoModel, AutoConfig
 
 
+# ==== DETR seeding helpers (copy weights giữa các layer tương thích) ====
+def _copy_enc_layer(dst, src):
+    with torch.no_grad():
+        # self-attn
+        dst.self_attn.in_proj_weight.copy_(src.self_attn.in_proj_weight)
+        dst.self_attn.in_proj_bias.copy_(src.self_attn.in_proj_bias)
+        dst.self_attn.out_proj.weight.copy_(src.self_attn.out_proj.weight)
+        dst.self_attn.out_proj.bias.copy_(src.self_attn.out_proj.bias)
+        # FFN
+        dst.linear1.weight.copy_(src.linear1.weight); dst.linear1.bias.copy_(src.linear1.bias)
+        dst.linear2.weight.copy_(src.linear2.weight); dst.linear2.bias.copy_(src.linear2.bias)
+        # Norms
+        dst.norm1.weight.copy_(src.norm1.weight); dst.norm1.bias.copy_(src.norm1.bias)
+        dst.norm2.weight.copy_(src.norm2.weight); dst.norm2.bias.copy_(src.norm2.bias)
+
+def _copy_dec_layer(dst, src):
+    with torch.no_grad():
+        # self-attn
+        dst.self_attn.in_proj_weight.copy_(src.self_attn.in_proj_weight)
+        dst.self_attn.in_proj_bias.copy_(src.self_attn.in_proj_bias)
+        dst.self_attn.out_proj.weight.copy_(src.self_attn.out_proj.weight)
+        dst.self_attn.out_proj.bias.copy_(src.self_attn.out_proj.bias)
+        # cross-attn
+        dst.multihead_attn.in_proj_weight.copy_(src.multihead_attn.in_proj_weight)
+        dst.multihead_attn.in_proj_bias.copy_(src.multihead_attn.in_proj_bias)
+        dst.multihead_attn.out_proj.weight.copy_(src.multihead_attn.out_proj.weight)
+        dst.multihead_attn.out_proj.bias.copy_(src.multihead_attn.out_proj.bias)
+        # FFN
+        dst.linear1.weight.copy_(src.linear1.weight); dst.linear1.bias.copy_(src.linear1.bias)
+        dst.linear2.weight.copy_(src.linear2.weight); dst.linear2.bias.copy_(src.linear2.bias)
+        # Norms
+        dst.norm1.weight.copy_(src.norm1.weight); dst.norm1.bias.copy_(src.norm1.bias)
+        dst.norm2.weight.copy_(src.norm2.weight); dst.norm2.bias.copy_(src.norm2.bias)
+        dst.norm3.weight.copy_(src.norm3.weight); dst.norm3.bias.copy_(src.norm3.bias)
+
+
 def load_weights(model: nn.Module, load_path: str) -> nn.Module:
     """
     Nạp trọng số linh hoạt từ nhiều định dạng checkpoint:
@@ -69,6 +105,18 @@ class MGVLF(nn.Module):
         if args is not None and getattr(args, "pretrain", ""):
             self.vlmodel = load_weights(self.vlmodel, args.pretrain)
 
+        # ===== SEED TỪ DETR: KHÔNG DÙNG PARSER, GỌI THẲNG Ở ĐÂY =====
+        try:
+            import os
+            ckpt = "./pretrained/detr_resnet50.pth"  # nếu bạn có file local, đặt vào đây
+            if os.path.isfile(ckpt):
+                self.seed_from_detr(ckpt_path=ckpt)          # seed từ file local
+            else:
+                self.seed_from_detr()                         # seed từ torch.hub (online lần đầu)
+            print("[DETR seed] done.")
+        except Exception as e:
+            print(f"[DETR seed] skipped: {e}")
+
         # -------- Localization Head --------
         self.box_head = nn.Sequential(
             nn.Linear(256, 256),
@@ -83,6 +131,44 @@ class MGVLF(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+    def seed_from_detr(self, ckpt_path: str | None = None, use_last_dec_layer: bool = False):
+        """
+        Khởi tạo các phần tương thích từ DETR-ResNet50 pretrained:
+        - input_proj 2048->256
+        - 6 encoder layers (cho cả encoder ảnh & encoder fusion)
+        - 1 decoder layer (cho DE của nhánh ảnh)
+        Nếu cung cấp ckpt_path: sẽ load state_dict vào model DETR hub rồi copy (offline-friendly).
+        """
+        # 1) Tạo model DETR hub (cần internet lần đầu để fetch kiến trúc)
+        detr = torch.hub.load('facebookresearch/detr', 'detr_resnet50', pretrained=True if ckpt_path is None else False)
+        detr.eval()
+
+        # 2) Nếu có ckpt riêng -> nạp vào detr
+        if ckpt_path is not None:
+            sd = torch.load(ckpt_path, map_location='cpu')
+            sd = sd.get('model', sd.get('state_dict', sd))
+            detr.load_state_dict(sd, strict=False)
+
+        # 3) input_proj
+        with torch.no_grad():
+            self.visumodel.input_proj.weight.copy_(detr.input_proj.weight)
+            self.visumodel.input_proj.bias.copy_(detr.input_proj.bias)
+
+        # 4) Encoder: copy 6 layers cho EN ảnh và EN fusion
+        for dst, src in zip(self.visumodel.transformer.encoder.layers,
+                            detr.transformer.encoder.layers):
+            _copy_enc_layer(dst, src)
+
+        for dst, src in zip(self.vlmodel.transformer.encoder.layers,
+                            detr.transformer.encoder.layers):
+            _copy_enc_layer(dst, src)
+
+        # 5) Decoder: model bạn dùng 1 layer -> copy từ layer[0] (hoặc [-1] nếu muốn)
+        dec_src = detr.transformer.decoder.layers[-1] if use_last_dec_layer else detr.transformer.decoder.layers[0]
+        _copy_dec_layer(self.visumodel.DE.decoder.layers[0], dec_src)
+
+        print("[DETR seed] Copied: input_proj + encoder(6) + decoder(1)")
 
     def forward(self, image, mask, word_id, word_mask, return_aux: bool = False):
         """
