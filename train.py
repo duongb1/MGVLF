@@ -95,7 +95,7 @@ def build_loaders(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               pin_memory=True, drop_last=True, num_workers=args.workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            pin_memory=True, drop_last=True, num_workers=args.workers)
+                            pin_memory=True, drop_last=False, num_workers=args.workers)
     print('trainset:', len(train_dataset), 'validationset:', len(val_dataset))
     return train_loader, val_loader
 
