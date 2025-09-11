@@ -181,7 +181,7 @@ class VLFusion(nn.Module):
         pl = self.l_proj(fl).transpose(1, 2)    # (B,256,L)
 
         # (3) Learnable pr token: (B,256,1)
-        pr = self.pr.weight.unsqueeze(0).expand(B, -1).unsqueeze(2)  # (B,256,1)
+        pr = self.pr.weight.expand(B, -1).unsqueeze(2)  # (B,256,1)
 
         # (4) Chuỗi fusion: src=(B,256,S)
         x0 = torch.cat((pv, pl, pr), dim=2)     # (B,256,S) với S = Lv + L + 1
