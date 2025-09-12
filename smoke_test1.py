@@ -200,7 +200,8 @@ def check_backbone_multiscale(model_visu, imgs, masks, args):
         # Nếu visumodel có thuộc tính 'backbone' kiểu Joiner
         back = model_visu.backbone
         from utils.misc import NestedTensor
-        samples = NestedTensor(imgs, masks)  # (B,3,H,W) + (B,H,W)
+        dev = next(model_visu.backbone.parameters()).device
+        samples = NestedTensor(imgs.to(dev), masks.to(dev))  # <-- move to CUDA
         feats, out_masks, pos = back(samples)
         print_ok("Backbone forward")
         n = len(feats)
@@ -214,16 +215,28 @@ def check_backbone_multiscale(model_visu, imgs, masks, args):
 
 def tiny_overfit_step(model, batch, device):
     imgs, masks, word_id, word_mask, gt_boxes = batch
-    imgs = imgs.to(device)
-    masks = masks.to(device)
-    word_id = word_id.to(device)
-    word_mask = word_mask.to(device)
-    gt_boxes = gt_boxes.to(device)
+    imgs, masks = imgs.to(device), masks.to(device)
+    word_id, word_mask = word_id.to(device), word_mask.to(device)
+    gt_boxes = gt_boxes.to(device)  # expected pixel x1,y1,x2,y2 on canvas
 
-    out = model(imgs, masks, word_id, word_mask)  # (B,4) sigmoid
-    # simple L1 to GT center/w/h (giả sử GT đã cùng canvas)
-    loss = torch.abs(out - gt_boxes).mean()
-    return out, loss
+    # Forward: normalized cx,cy,w,h in [0,1]
+    out = model(imgs, masks, word_id, word_mask)  # (B,4)
+
+    # Convert pred to pixel x1,y1,x2,y2 on canvas
+    B, C, H, W = imgs.shape
+    cx = out[:, 0] * W
+    cy = out[:, 1] * H
+    ww = out[:, 2] * W
+    hh = out[:, 3] * H
+    x1 = cx - ww / 2
+    y1 = cy - hh / 2
+    x2 = cx + ww / 2
+    y2 = cy + hh / 2
+    pred_boxes = torch.stack([x1, y1, x2, y2], dim=1)
+
+    # L1 sanity loss (just for smoke test)
+    loss = (pred_boxes - gt_boxes).abs().mean()
+    return pred_boxes, loss
 
 def main():
     args = parse_args()
@@ -246,6 +259,10 @@ def main():
     model = MGVLF(bert_model=margs.bert_model, tunebert=True, args=margs).to(device)
     model.eval()
     print_ok("Model built")
+    
+    # Check if multi-scale is actually enabled
+    print(f"[DBG] input_proj type: {type(model.visumodel.input_proj).__name__}")
+    # Expect: 'ModuleList' when aux_loss=True (or masks=True); 'Conv2d' means single-scale.
 
     # 3) Backbone multi-scale check
     check_backbone_multiscale(model.visumodel, imgs, masks, margs)
