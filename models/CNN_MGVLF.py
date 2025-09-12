@@ -85,7 +85,23 @@ class CNN_MGVLF(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        # Sau khi self.backbone = backbone
+        hidden_dim = transformer.d_model
+        num_chs = getattr(backbone, "num_channels", [2048])
+        if not isinstance(num_chs, (list, tuple)):
+            num_chs = [num_chs]
+
+        if len(num_chs) == 1:
+            # single-scale (C5)
+            self.input_proj = nn.Conv2d(num_chs[0], hidden_dim, kernel_size=1)
+        else:
+            # multi-scale (C3/C4/C5)
+            self.input_proj = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(c, hidden_dim, kernel_size=1),
+                    nn.GroupNorm(32, hidden_dim),
+                ) for c in num_chs
+            ])
         self.l_proj = torch.nn.Sequential(nn.Linear(768, hidden_dim), nn.ReLU(), )
 
     def get_mask(self, nextFeatureMap, beforeMask):
@@ -104,7 +120,22 @@ class CNN_MGVLF(nn.Module):
         """
         samples = NestedTensor(img, mask)
         features, pos = self.backbone(samples)
-        featureMap4, mask4 = features[-1].decompose()
+        
+        # Handle multi-scale vs single-scale input_proj
+        if isinstance(self.input_proj, nn.ModuleList):
+            # Multi-scale: project each feature map
+            feats_proj = []
+            for i, proj in enumerate(self.input_proj):
+                feat_tensor = features[i].tensors if hasattr(features[i], "tensors") else features[i]
+                feats_proj.append(proj(feat_tensor))
+            # Use the highest resolution (first in multi-scale)
+            featureMap4 = feats_proj[0]  # C3 level
+            mask4 = features[0].mask if hasattr(features[0], "mask") else mask
+        else:
+            # Single-scale: use C5 (last feature)
+            featureMap4, mask4 = features[-1].decompose()
+            featureMap4 = self.input_proj(featureMap4)  # (B,256,H,W)
+        
         bs, c, h, w = featureMap4.shape
 
         # pyramid convs
@@ -116,8 +147,8 @@ class CNN_MGVLF(nn.Module):
         conv8_2 = self.conv8_2(conv8_1)
 
         # flatten visual feats
-        conv5 = self.input_proj(featureMap4)      # (B,256,H,W)
-        fv1 = conv5.view(bs, 256, -1)
+        conv5 = featureMap4  # Already projected to hidden_dim
+        fv1 = conv5.view(bs, c, -1)  # Use actual channel count 'c'
         fv2 = conv6_2.view(bs, 256, -1)
         fv3 = conv7_2.view(bs, 256, -1)
         fv4 = conv8_2.view(bs, 256, -1)

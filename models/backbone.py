@@ -59,12 +59,15 @@ class BackboneBase(nn.Module):
             parameter.requires_grad_(bool(allow_train))
 
         if return_interm_layers:
-            return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+            # Multi-scale: C3/C4/C5
+            return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
+            self.num_channels = [512, 1024, 2048]
         else:
+            # Single-scale: C5
             return_layers = {"layer4": "0"}
+            self.num_channels = [2048]
 
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
-        self.num_channels = num_channels
 
     def forward(self, tensor_list: NestedTensor):
         xs = self.body(tensor_list.tensors)  # OrderedDict[str, Tensor]
