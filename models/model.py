@@ -152,6 +152,7 @@ class MGVLF(nn.Module):
     def seed_from_detr(self, ckpt_path: str, use_last_dec_layer: bool = False):
         """
         Copy weight từ checkpoint DETR ResNet-50 (COCO pretrained).
+        Hỗ trợ cả VLFusion transformer kiểu cũ (.encoder.layers) và SeqEncoder1D (.layers).
         """
         sd = torch.load(ckpt_path, map_location="cpu")
         sd = sd.get("model", sd.get("state_dict", sd))
@@ -162,16 +163,21 @@ class MGVLF(nn.Module):
         except Exception as e:
             print(f"[DETR seed] backbone copy skipped: {e}")
 
-        # 1) input_proj
+        # (1) input_proj
         with torch.no_grad():
             self.visumodel.input_proj.weight.copy_(sd["input_proj.weight"])
             self.visumodel.input_proj.bias.copy_(sd["input_proj.bias"])
 
-        # 2) encoder layers
-        for i, (dst_visu, dst_vlf) in enumerate(
-            zip(self.visumodel.transformer.encoder.layers,
-                self.vlmodel.transformer.encoder.layers)
-        ):
+        # (2) encoder layers -> visual EN + fusion EN
+        visu_layers = getattr(self.visumodel.transformer, "encoder").layers
+        # VLFusion: chấp nhận hai kiểu: encoder.layers (cũ) hoặc layers (SeqEncoder1D)
+        fusion_enc = getattr(self.vlmodel.transformer, "encoder", None)
+        if fusion_enc is not None and hasattr(fusion_enc, "layers"):
+            fusion_layers = fusion_enc.layers
+        else:
+            fusion_layers = getattr(self.vlmodel.transformer, "layers", None)
+
+        for i, dst_visu in enumerate(visu_layers):
             prefix = f"transformer.encoder.layers.{i}"
             src = types.SimpleNamespace(
                 self_attn=types.SimpleNamespace(
@@ -200,9 +206,10 @@ class MGVLF(nn.Module):
                 ),
             )
             _copy_enc_layer(dst_visu, src)
-            _copy_enc_layer(dst_vlf, src)
+            if fusion_layers is not None and i < len(fusion_layers):
+                _copy_enc_layer(fusion_layers[i], src)
 
-        # 3) decoder layer (1 layer)
+        # (3) decoder layer (1 layer) vào DE nhánh visual
         dec_id = -1 if use_last_dec_layer else 0
         prefix = f"transformer.decoder.layers.{dec_id}"
         src_dec = types.SimpleNamespace(
