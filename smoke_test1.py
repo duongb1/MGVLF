@@ -54,23 +54,98 @@ def build_dataset(args):
     print_ok("RSVGDataset init", f"len={len(ds)}")
     return ds
 
+import numpy as np
+import torch
+
 def collate_fn(batch):
-    # batch: list of tuples theo output của RSVGDataset
-    imgs, masks, word_id, word_mask, gt_boxes = [], [], [], [], []
-    for b in batch:
-        # chỉnh nếu RSVGDataset trả khác thứ tự:
-        # ví dụ bạn đang trả (img, pad_mask, word_id, word_mask, box)
-        imgs.append(b[0])
-        masks.append(b[1])
-        word_id.append(b[2])
-        word_mask.append(b[3])
-        gt_boxes.append(b[4])
-    imgs = torch.stack(imgs, 0).float()
-    masks = torch.stack(masks, 0).bool()
-    word_id = torch.stack(word_id, 0).long()
-    word_mask = torch.stack(word_mask, 0).long()
-    gt_boxes = torch.stack(gt_boxes, 0).float()
+    """
+    Kỳ vọng mỗi item trong batch là:
+      (img, pad_mask, word_id, word_mask, gt_box)
+    - img: np.ndarray HxWxC (RGB/BGR) hoặc torch.Tensor CxHxW
+    - pad_mask: np.ndarray HxW or torch.BoolTensor (True=pad)
+    - word_id: np.ndarray/torch.LongTensor (L,)
+    - word_mask: np.ndarray/torch.LongTensor (L,) with 1=real, 0=pad
+    - gt_box: np.ndarray/torch.FloatTensor (4,) theo canvas sau letterbox [x1,y1,x2,y2] hoặc [cx,cy,w,h]
+    """
+
+    imgs, masks, word_ids, word_masks, gt_boxes = [], [], [], [], []
+
+    def to_img_tensor(x):
+        # -> torch.FloatTensor (C,H,W)
+        if isinstance(x, torch.Tensor):
+            t = x
+            if t.ndim == 3 and t.shape[0] in (1,3):  # C,H,W
+                return t.float()
+            if t.ndim == 3 and t.shape[-1] in (1,3):  # H,W,C
+                return t.permute(2,0,1).float()
+            raise RuntimeError(f"Unexpected image tensor shape: {t.shape}")
+        elif isinstance(x, np.ndarray):
+            if x.ndim == 3 and x.shape[-1] in (1,3):  # H,W,C
+                t = torch.from_numpy(x).permute(2,0,1).contiguous().float()
+                return t
+            if x.ndim == 3 and x.shape[0] in (1,3):  # C,H,W
+                return torch.from_numpy(x).contiguous().float()
+            raise RuntimeError(f"Unexpected image array shape: {x.shape}")
+        else:
+            raise TypeError(f"img type must be tensor or ndarray, got {type(x)}")
+
+    def to_mask_tensor(x):
+        # -> torch.BoolTensor (H,W), True = pad
+        if isinstance(x, torch.Tensor):
+            if x.dtype != torch.bool:
+                x = x != 0
+            return x.bool()
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).bool()
+        else:
+            raise TypeError(f"mask type must be tensor or ndarray, got {type(x)}")
+
+    def to_long_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x.long()
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).long()
+        else:
+            raise TypeError(f"long tensor expects ndarray/tensor, got {type(x)}")
+
+    def to_float_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x.float()
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).float()
+        else:
+            raise TypeError(f"float tensor expects ndarray/tensor, got {type(x)}")
+
+    for item in batch:
+        img, pad_mask, wid, wmask, gt = item  # điều chỉnh nếu thứ tự khác
+        imgs.append(to_img_tensor(img))
+        masks.append(to_mask_tensor(pad_mask))
+        word_ids.append(to_long_tensor(wid))
+        word_masks.append(to_long_tensor(wmask))
+        gt_boxes.append(to_float_tensor(gt))
+
+    # Chuẩn hoá shape nhất quán
+    # Ảnh: (B,C,H,W)
+    imgs = torch.stack(imgs, dim=0)
+    # Mask: (B,H,W)
+    masks = torch.stack(masks, dim=0)
+    # Text: (B,L)
+    word_id = torch.stack(word_ids, dim=0)
+    word_mask = torch.stack(word_masks, dim=0)
+    # GT box: (B,4)
+    gt_boxes = torch.stack(gt_boxes, dim=0)
+
+    # Kiểm tra nhanh (1 lần)
+    if not hasattr(collate_fn, "_once"):
+        print("[COLLATE] imgs", imgs.shape, imgs.dtype)
+        print("[COLLATE] masks", masks.shape, masks.dtype)
+        print("[COLLATE] word_id", word_id.shape, word_id.dtype)
+        print("[COLLATE] word_mask unique:", sorted(torch.unique(word_mask).tolist()))
+        print("[COLLATE] gt_boxes", gt_boxes.shape, gt_boxes.dtype)
+        collate_fn._once = True
+
     return imgs, masks, word_id, word_mask, gt_boxes
+
 
 def check_polarity(word_mask):
     # HF: 1=real, 0=pad
