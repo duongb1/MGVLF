@@ -126,12 +126,42 @@ class MGVLF(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    # NEW: copy ResNet backbone từ ckpt DETR
+    def _copy_resnet_backbone_from_detr(self, sd):
+        """
+        Copy ResNet backbone từ ckpt DETR sang backbone hiện tại.
+        Map từ 'backbone.0.body.*' (hoặc 'backbone.body.*') -> self.visumodel.backbone[0].body.*
+        """
+        # Joiner(backbone, pos) => [0] là BackboneBase; .body là IntermediateLayerGetter
+        tgt = self.visumodel.backbone[0].body
+        tgt_sd = tgt.state_dict()
+
+        prefixes = ["backbone.0.body.", "backbone.body."]
+        copied = 0
+        for k, v in sd.items():
+            pref = next((p for p in prefixes if k.startswith(p)), None)
+            if pref is None:
+                continue
+            kk = k[len(pref):]  # ví dụ 'layer1.0.conv1.weight'
+            if kk in tgt_sd and tgt_sd[kk].shape == v.shape:
+                tgt_sd[kk] = v
+                copied += 1
+
+        tgt.load_state_dict(tgt_sd, strict=False)
+        print(f"[DETR seed] Copied ResNet backbone params: {copied}")
+
     def seed_from_detr(self, ckpt_path: str, use_last_dec_layer: bool = False):
         """
         Copy weight từ checkpoint DETR ResNet-50 (COCO pretrained).
         """
         sd = torch.load(ckpt_path, map_location="cpu")
         sd = sd.get("model", sd.get("state_dict", sd))
+
+        # (0) COPY BACKBONE RESNET TỪ DETR
+        try:
+            self._copy_resnet_backbone_from_detr(sd)
+        except Exception as e:
+            print(f"[DETR seed] backbone copy skipped: {e}")
 
         # 1) input_proj
         with torch.no_grad():
@@ -216,7 +246,7 @@ class MGVLF(nn.Module):
         )
         _copy_dec_layer(self.visumodel.DE.decoder.layers[0], src_dec)
 
-        print("[DETR seed] Copied: input_proj + encoder(6) + decoder(1)")
+        print("[DETR seed] Copied: backbone + input_proj + encoder(6) + decoder(1)")
 
     def forward(self, image, mask, word_id, word_mask, return_aux: bool = False):
         # word ids / masks
@@ -230,9 +260,9 @@ class MGVLF(nn.Module):
         else:
             word_mask = word_mask.to(image.device).long()
 
-        # HF expects 1=real, 0=pad; key_padding_mask needs True=pad
-        attn_mask = word_mask                       # (B,L) with 1=real for BERT
-        key_pad   = (word_mask == 0).bool()         # (B,L) True=pad for DE/VLF
+        # HF expects 1=real, 0=pad; key_padding_mask needs True=pad (nếu cần)
+        attn_mask = word_mask                       # (B,L) with 1=real cho BERT
+        # key_pad   = (word_mask == 0).bool()       # (B,L) True=pad (KHÔNG cần pass xuống vì các module tự xử lý)
 
         # 1) text encoder
         outputs = self.textmodel(
@@ -249,13 +279,13 @@ class MGVLF(nn.Module):
         if not self.tunebert:
             fl = fl.detach(); sentence_feature = sentence_feature.detach()
 
-        # 2) visual encoder  —— PASS HF mask (1=real, 0=pad)
+        # 2) visual encoder  —— PASS HF mask (1=real, 0=pad) để module tự đảo
         fv = self.visumodel(image, mask, word_mask, fl, sentence_feature)
 
-        # 3) fusion  —— PASS HF mask (1=real, 0=pad)
+        # 3) fusion  —— PASS HF mask (1=real, 0=pad) để module tự đảo
         x = self.vlmodel(fv, fl, word_mask)
 
-        # 4) feature for head - take [pr] token at index 0
+        # 4) feature cho head - lấy [pr] token ở index 0
         if x.dim() == 2 and x.size(1) == 256:
             feat = x
         elif x.dim() == 3:
