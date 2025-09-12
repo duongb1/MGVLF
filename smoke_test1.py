@@ -195,23 +195,39 @@ def build_args_for_model(ns):
 
 @torch.no_grad()
 def check_backbone_multiscale(model_visu, imgs, masks, args):
-    # gọi nhánh backbone bên trong visumodel nếu có expose; fallback: chạy visumodel ở chế độ dry
     try:
-        # Nếu visumodel có thuộc tính 'backbone' kiểu Joiner
-        back = model_visu.backbone
         from utils.misc import NestedTensor
         dev = next(model_visu.backbone.parameters()).device
-        samples = NestedTensor(imgs.to(dev), masks.to(dev))  # <-- move to CUDA
-        feats, out_masks, pos = back(samples)
-        print_ok("Backbone forward")
+        samples = NestedTensor(imgs.to(dev), masks.to(dev))
+
+        outs = model_visu.backbone(samples)
+        # 3 kiểu trả về phổ biến:
+        # (feats, masks, pos)  or  (feats, pos)  or  ([NestedTensor...], pos)
+        if isinstance(outs, tuple) and len(outs) == 3:
+            feats, out_masks, pos = outs
+        elif isinstance(outs, tuple) and len(outs) == 2:
+            a, pos = outs
+            # a có thể là list[Tensor] hoặc list[NestedTensor]
+            if isinstance(a, (list, tuple)) and hasattr(a[0], "tensors"):
+                feats = [nt.tensors for nt in a]
+            else:
+                feats = list(a)
+        else:
+            # Fallback: coi outs là list[NestedTensor] hoặc list[Tensor]
+            feats = [x.tensors if hasattr(x, "tensors") else x for x in outs]
+
         n = len(feats)
         ch = [f.shape[1] for f in feats]
-        print(f"[DBG] backbone maps={n}, channels={ch}")
+        print("[OK] Backbone forward")
+        print("[DBG] maps:", n, "channels:", ch)
+
         expect = 3 if (args.aux_loss or args.masks) else 1
         if n != expect:
-            print_warn("Unexpected #feature maps", f"got {n}, expect {expect}")
+            print(f"[WARN] Unexpected #feature maps: got {n}, expect {expect} "
+                  f"(aux_loss={args.aux_loss}, masks={args.masks})")
     except Exception as e:
-        print_warn("Backbone debug skipped", str(e))
+        print("[WARN] Backbone debug skipped -", e)
+
 
 def tiny_overfit_step(model, batch, device):
     imgs, masks, word_id, word_mask, gt_boxes = batch
@@ -257,6 +273,7 @@ def main():
     # 2) Model build
     margs = build_args_for_model(args)
     model = MGVLF(bert_model=margs.bert_model, tunebert=True, args=margs).to(device)
+    print("[DBG] input_proj type:", type(model.visumodel.input_proj).__name__)
     model.eval()
     print_ok("Model built")
     
