@@ -79,24 +79,28 @@ class BackboneBase(nn.Module):
 
 
 class Backbone(BackboneBase):
-    """ResNet backbone with FrozenBatchNorm (không load ImageNet)."""
+    """ResNet backbone with FrozenBatchNorm (có tùy chọn ImageNet-pretrained)."""
     def __init__(self, name: str, train_backbone: bool,
-                 return_interm_layers: bool, dilation: bool):
+                 return_interm_layers: bool, dilation: bool,
+                 pretrained: bool = True):
         ctor = getattr(torchvision.models, name)
 
-        # KHÔNG load ImageNet pretrained -> weights=None / pretrained=False
         try:
-            # API mới (torchvision>=0.13): dùng tham số weights=None
+            # API torchvision mới: dùng 'weights'
+            if pretrained and name == "resnet50":
+                weights = torchvision.models.ResNet50_Weights.IMAGENET1K_V1
+            else:
+                weights = None
             backbone = ctor(
-                weights=None,
+                weights=weights,
                 replace_stride_with_dilation=[False, False, dilation],
                 norm_layer=FrozenBatchNorm2d,
             )
         except TypeError:
-            # API cũ: dùng pretrained=False
+            # API cũ: dùng 'pretrained'
             backbone = ctor(
                 replace_stride_with_dilation=[False, False, dilation],
-                pretrained=False,
+                pretrained=bool(pretrained),
                 norm_layer=FrozenBatchNorm2d,
             )
 
@@ -122,23 +126,33 @@ class Joiner(nn.Sequential):
 
 
 def build_backbone(args):
-    # PE cho ảnh (thường 'sine'); đừng nhầm với PE 1D của fusion
+    # hidden_dim mặc định 256
+    hidden_dim = int(getattr(args, 'hidden_dim', 256))
+    if not hasattr(args, 'num_pos_feats'):
+        args.num_pos_feats = hidden_dim // 2
+
+    # Positional encoding (2D)
     position_embedding = build_position_encoding(
         args, position_embedding=getattr(args, 'img_pe_type', 'sine')
     )
 
-    # ---- dùng lr_backbone để quyết định có train backbone hay không ----
+    # Train backbone nếu lr_backbone > 0
     train_backbone = getattr(args, 'lr_backbone', 0.0) > 0.0
 
-    # Trả trung gian nếu cần mask/DETR-like
-    return_interm_layers = bool(getattr(args, "masks", False))
+    # Multi-scale khi masks=True hoặc aux_loss=True
+    return_interm_layers = bool(
+        getattr(args, "masks", False) or getattr(args, "aux_loss", False)
+    )
 
     backbone = Backbone(
         name=args.backbone,
         train_backbone=train_backbone,
         return_interm_layers=return_interm_layers,
         dilation=bool(getattr(args, "dilation", False)),
+        pretrained=True,  # KHỞI TẠO từ ImageNet
     )
+
+    # Joiner của bạn đã có/hoặc bạn đã thêm input_proj -> hidden_dim
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

@@ -165,8 +165,13 @@ class MGVLF(nn.Module):
 
         # (1) input_proj
         with torch.no_grad():
-            self.visumodel.input_proj.weight.copy_(sd["input_proj.weight"])
-            self.visumodel.input_proj.bias.copy_(sd["input_proj.bias"])
+            if isinstance(self.visumodel.input_proj, torch.nn.Conv2d):
+                self.visumodel.input_proj.weight.copy_(sd["input_proj.weight"])
+                self.visumodel.input_proj.bias.copy_(sd["input_proj.bias"])
+                print("[DETR seed] copied input_proj (single-scale)")
+            else:
+                # multi-scale: DETR gốc chỉ có 1 input_proj -> bỏ qua cho gọn
+                print("[DETR seed] skip input_proj (multi-scale detected)")
 
         # (2) encoder layers -> visual EN + fusion EN
         visu_layers = getattr(self.visumodel.transformer, "encoder").layers
