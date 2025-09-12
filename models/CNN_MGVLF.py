@@ -142,11 +142,6 @@ class CNN_MGVLF(nn.Module):
             # single-scale fallback: only C5
             proj_feats = [self.input_proj(c5)]
 
-        # (optional) one-time debug
-        if not hasattr(self, "_once_dbg"):
-            print("[DBG][CNN] raw:", [t.shape[1] for t in [c3, c4, c5]], "| proj:", [t.shape[1] for t in proj_feats])
-            self._once_dbg = True
-
         # Get masks from original features
         mask4 = feats_any[-1].mask if hasattr(feats_any[-1], "mask") else mask
         bs, _, h, w = c5.shape

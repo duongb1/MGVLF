@@ -219,7 +219,6 @@ def check_backbone_multiscale(model_visu, imgs, masks, args):
         n = len(feats)
         ch = [f.shape[1] for f in feats]
         print("[OK] Backbone forward")
-        print("[DBG] maps:", n, "channels:", ch)
 
         expect = 3 if (args.aux_loss or args.masks) else 1
         if n != expect:
@@ -273,13 +272,8 @@ def main():
     # 2) Model build
     margs = build_args_for_model(args)
     model = MGVLF(bert_model=margs.bert_model, tunebert=True, args=margs).to(device)
-    print("[DBG] input_proj type:", type(model.visumodel.input_proj).__name__)
     model.eval()
     print_ok("Model built")
-    
-    # Check if multi-scale is actually enabled
-    print(f"[DBG] input_proj type: {type(model.visumodel.input_proj).__name__}")
-    # Expect: 'ModuleList' when aux_loss=True (or masks=True); 'Conv2d' means single-scale.
 
     # 3) Backbone multi-scale check
     check_backbone_multiscale(model.visumodel, imgs, masks, margs)
