@@ -22,7 +22,8 @@ from utils.utils import AverageMeter, xyxy2xywh, bbox_iou, adjust_learning_rate
 from utils.checkpoint import save_checkpoint, load_pretrain, load_resume
 
 # ===== AMP: import autocast + GradScaler =====
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
+
 
 
 def parse_args():
@@ -198,10 +199,10 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
         gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
         # ====== AMP: forward dưới autocast (model fp16/bf16), loss ở fp32 ======
-        with autocast(dtype=torch.float16):
+        with autocast(device_type="cuda", dtype=torch.float16):
             pred_bbox = model(imgs, masks, word_id, word_mask)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with autocast(device_type="cuda", enabled=False):
             pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
             gt_bbox_f   = gt_bbox.float()       # xyxy in pixel
 
@@ -288,10 +289,10 @@ def validate_epoch(val_loader, model, args):
         gt_bbox = bbox
 
         # ====== AMP: chỉ forward ở autocast, còn lại fp32 ======
-        with autocast(dtype=torch.float16):
+        with autocast(device_type="cuda", dtype=torch.float16):
             pred_bbox = model(imgs, masks, word_id, word_mask)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with autocast(device_type="cuda", enabled=False):
             pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
             gt_bbox_f   = gt_bbox.float()       # xyxy in pixel
 
@@ -377,7 +378,8 @@ def main():
     model, optimizer = build_model(args)
 
     # ===== AMP: khởi tạo GradScaler =====
-    scaler = GradScaler()
+    scaler = GradScaler(device="cuda")
+
 
     # train loop
     if not hasattr(args, "start_epoch"):
