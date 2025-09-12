@@ -104,7 +104,7 @@ class CNN_MGVLF(nn.Module):
         """
         samples = NestedTensor(img, mask)
         features, pos = self.backbone(samples)
-        featureMap4, mask4 = features[3].decompose()
+        featureMap4, mask4 = features[-1].decompose()
         bs, c, h, w = featureMap4.shape
 
         # pyramid convs
