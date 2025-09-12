@@ -235,8 +235,16 @@ def check_backbone(args):
     PASS("Mask sau nội suy vẫn nhị phân (nearest).")
 
     trainable = [(n, p.requires_grad) for n, p in backbone[0].body.named_parameters()]
-    any_l2l4_true = any((("layer2" in n) or ("layer3" in n) or ("layer4" in n)) and rg for n, rg in trainable)
-    any_c1l1_true = any((("conv1" in n) or ("bn1" in n) or ("layer1" in n)) and rg for n, rg in trainable)
+
+    seg = lambda n: n.split('.', 1)[0]  # only the top-level block name
+
+    any_l2l4_true = any(seg(n) in {'layer2', 'layer3', 'layer4'} and rg for n, rg in trainable)
+    any_c1l1_true = any(seg(n) in {'conv1', 'bn1', 'layer1'} and rg for n, rg in trainable)
+    
+    # Optional debug to see what's trainable
+    print("[DBG init trainable]", [n for n, rg in trainable if rg and seg(n) in {'conv1','bn1','layer1'}])
+    print("[DBG l234 trainable]", [n for n, rg in trainable if rg and seg(n) in {'layer2','layer3','layer4'}][:10])
+    
     _exit_if(not any_l2l4_true, "layer2/3/4 không trainable? Kiểm tra lr_backbone/train_backbone.")
     _exit_if(any_c1l1_true, "conv1/bn1/layer1 đang trainable (mong muốn freeze).")
     PASS("Freeze flags backbone hợp lý (layer2-4 trainable, conv1/bn1/layer1 frozen).")
