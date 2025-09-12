@@ -2,23 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-SMOKE TEST cho RSVG/MGVLF
+SMOKE TEST cho RSVG/MGVLF: Data pipeline + Backbone + Fusion [pr] token.
 
-Kiểm tra nhanh các lỗi hay gặp:
-A) HF attention_mask polarity & key_padding_mask (True=pad)
-B) Letterbox scale/shift (ratio có thể là float hoặc (rx,ry))
-C) Lấy đúng [pr] token cho head
-+ Sanity: IoU=1 khi pred=GT; dtype/shape; mask 2D bool True=pad
-
-Cách chạy (ví dụ):
-python tools/smoke_test.py \
-  --images_path /path/to/DIOR/JPEGImages \
-  --anno_path   /path/to/DIOR/Annotations \
-  --splits_dir  /path/to/DIOR_RSVG \
-  --imsize 640 \
+Chạy (ví dụ Kaggle):
+python smoke_test.py \
+  --images_path "/kaggle/input/dior-rsvg/DIOR_RSVG/JPEGImages" \
+  --anno_path   "/kaggle/input/dior-rsvg/DIOR_RSVG/Annotations" \
+  --splits_dir  "/kaggle/input/dior-rsvg/DIOR_RSVG" \
   --split val \
-  --limit 64 \
+  --imsize 640 \
+  --limit 32 \
   --device cuda
+
+Kiểm tra:
+- Dataset: pad_mask (bool, True=pad), letterbox ratio/dw/dh nghịch đảo được bbox,
+           tokenizer masks dtype, collate shapes/dtypes.
+- Backbone: num_channels, mask nội suy (bool), pos dtype khớp feature, freeze flags hợp lý.
+- Fusion: hook output chuỗi, so head trên token 0 vs token -1 (kỳ vọng token 0 tốt hơn/không tệ hơn),
+          kiểm tra pad token count (HF: 0=pad → key_pad=(word_mask==0)).
+- Sanity: IoU(pred=GT)=1.0
 """
 
 import os
@@ -28,22 +30,31 @@ import argparse
 import traceback
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-# project imports
+# local repo imports
 from data_loader import RSVGDataset
+from utils.misc import collate_fn, NestedTensor
+from utils.utils import bbox_iou  # dùng IoU torch
+from models.backbone import build_backbone
 from models.model import MGVLF
-from utils.misc import collate_fn
-from utils.utils import bbox_iou, _sanitize_xyxy_t
 
 
-def _ok(msg):  print(f"[PASS] {msg}")
-def _bad(msg): print(f"[FAIL] {msg}")
-
+# ---------- helpers ----------
+def PASS(msg): print(f"[PASS] {msg}")
+def FAIL(msg): print(f"[FAIL] {msg}") or sys.exit(1)
 def _exit_if(cond, msg, code=1):
     if cond:
-        _bad(msg)
+        FAIL(msg)
         sys.exit(code)
+
+def _sanitize_xyxy_t(x: torch.Tensor) -> torch.Tensor:
+    x1 = torch.minimum(x[:, 0], x[:, 2])
+    y1 = torch.minimum(x[:, 1], x[:, 3])
+    x2 = torch.maximum(x[:, 0], x[:, 2])
+    y2 = torch.maximum(x[:, 1], x[:, 3])
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
 
 @torch.no_grad()
 def sanity_iou_one():
@@ -51,127 +62,181 @@ def sanity_iou_one():
     iou, _, _ = bbox_iou(gt, gt, x1y1x2y2=True)
     val = float(iou.mean().item())
     if not math.isclose(val, 1.0, rel_tol=0, abs_tol=1e-6):
-        _bad(f"IoU(pred=GT) != 1.0 (got {val:.6f})"); return False
-    _ok("IoU(pred=GT)=1.000000"); return True
+        FAIL(f"IoU(pred=GT) != 1.0 (got {val:.6f})")
+    PASS("IoU(pred=GT) == 1.0")
 
 
+# ---------- arg shim cho backbone/model ----------
+def build_args_shim(device: str):
+    class A: pass
+    a = A()
+    # backbone / PE
+    a.backbone = 'resnet50'
+    a.img_pe_type = 'sine'
+    a.dilation = False
+    a.masks = True           # cần intermediate layers
+    # dims
+    a.hidden_dim = 256
+    # train flags (không dùng train ở đây, nhưng backbone sẽ set freeze dựa vào lr_backbone)
+    a.lr = 1e-4
+    a.lr_backbone = 1e-5
+    a.lr_drop = 60
+    a.lr_dec = 0.1
+    # fusion PE 1D
+    a.fusion_pe_max_len = 4096
+    # device
+    a.device = device
+    # pretrain (seed_from_detr trong model.py sẽ tự xử lý nếu có)
+    a.pretrain = ""
+    return a
+
+
+# ---------- hook lấy output chuỗi cuối của VLFusion ----------
 class HookFusionOut:
-    """Gắn hook để lấy output cuối của VLFusion.transformer (chuỗi fusion)."""
     def __init__(self, vlmodel):
         self.last = None
         self.h = vlmodel.transformer.register_forward_hook(self._hook)
 
     def _hook(self, module, inp, out):
-        # out thường là list layer outputs; lấy phần cuối
         try:
-            self.last = out[-1].detach()
+            self.last = out[-1].detach()  # list of layers -> lấy cuối
         except Exception:
-            self.last = out.detach()
+            self.last = out.detach()      # một số impl trả trực tiếp tensor
 
     def close(self):
         if self.h: self.h.remove()
 
 
-def build_args_shim(device="cuda", im_pe="sine"):
-    class _A:
-        pass
-    a = _A()
-    a.backbone = 'resnet50'
-    a.img_pe_type = im_pe
-    a.dilation = False
-    a.masks = True
-    a.hidden_dim = 256
-    a.device = device
-    a.lr, a.lr_backbone, a.lr_drop, a.lr_dec = 1e-4, 1e-5, 60, 0.1
-    a.fusion_pe_max_len = 4096
-    a.pretrain = ""     # seed_from_detr trong model.py sẽ tự xử lý
-    return a
-
-
-@torch.no_grad()
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--images_path", required=True)
-    ap.add_argument("--anno_path",   required=True)
-    ap.add_argument("--splits_dir",  required=True)
-    ap.add_argument("--split", default="val", choices=["train","val","test"])
-    ap.add_argument("--imsize", type=int, default=640)
-    ap.add_argument("--limit", type=int, default=32, help="số mẫu kiểm nhanh")
-    ap.add_argument("--batch_size", type=int, default=8)
-    ap.add_argument("--num_workers", type=int, default=2)
-    ap.add_argument("--device", default="cuda")
-    args = ap.parse_args()
-
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-
-    # ========== SANITY 0: IoU=1 ==========
-    sanity_iou_one()
-
-    # ========== PASS 1: kiểm Letterbox/ratio & mask 2D bool ==========
-    ds_test = RSVGDataset(
+# ---------- checks ----------
+def check_dataset_unit(args):
+    """Kiểm tra từng mẫu ở chế độ testmode=True: pad_mask dtype, letterbox ratio/dw/dh nghịch đảo được."""
+    ds_t = RSVGDataset(
         images_path=args.images_path, anno_path=args.anno_path,
         imsize=args.imsize, transform=None, augment=False,
         split=args.split, testmode=True, max_query_len=40,
         splits_dir=args.splits_dir
     )
-    n = min(args.limit, len(ds_test)) if args.limit>0 else min(16, len(ds_test))
-    n = max(n, 1)
+    n = min(args.limit or 16, len(ds_t))
+    _exit_if(n == 0, "Dataset rỗng? Kiểm tra đường dẫn.")
 
-    ok_mask_dtype = True
-    ok_ratio = True
+    ok_mask_bool, ok_ratio = True, True
     any_pad_true = False
+    any_word_mask_int = True
 
     for i in range(n):
-        img, pad_mask, word_id, word_mask, bbox_px, ratio, dw, dh, img_path, phrase = ds_test[i]
-        # pad_mask: bool True=pad?
-        ok_mask_dtype &= (pad_mask.dtype == np.bool_)
+        img, pad_mask, word_id, word_mask, bbox_px, ratio, dw, dh, *_ = ds_t[i]
+        ok_mask_bool &= (pad_mask.dtype == np.bool_)
         any_pad_true |= bool(pad_mask.any())
+        any_word_mask_int &= (word_mask.dtype in (np.int64, np.int32))
 
-        # forward letterbox mapping check (original -> letterboxed)
-        # vì dataset đã làm hộ, ta kiểm tra ngược: (bbox - [dw,dh]) / r ≈ original
-        # Đáng tiếc original bbox không trả, nên ta check nhất quán: scale ngược rồi lại scale thuận.
-        bx = bbox_px.copy().astype(np.float32)
-        # inverse
+        bx = bbox_px.astype(np.float32)
         if isinstance(ratio, (tuple, list, np.ndarray)):
             rx, ry = float(ratio[0]), float(ratio[1])
         else:
             rx = ry = float(ratio)
         inv = np.array([(bx[0]-dw)/rx, (bx[1]-dh)/ry, (bx[2]-dw)/rx, (bx[3]-dh)/ry], dtype=np.float32)
-        # forward lại
         fwd = np.array([inv[0]*rx+dw, inv[1]*ry+dh, inv[2]*rx+dw, inv[3]*ry+dh], dtype=np.float32)
-        ok_ratio &= (np.allclose(fwd, bx, atol=1e-3))
+        ok_ratio &= np.allclose(fwd, bx, atol=1e-3)
 
-    _exit_if(not ok_mask_dtype, "pad_mask không phải bool")
-    _ok("pad_mask là bool (True=pad)")
-    _exit_if(not any_pad_true, "pad_mask không có vùng pad nào (ảnh có thể không bị pad, nhưng nên thấy ít nhất 1 mẫu True)")
-    _ok("pad_mask có vùng pad=True ở một số mẫu")
-    _exit_if(not ok_ratio, "Letterbox scale/shift sai (không nghịch đảo được bbox)")
-    _ok("Letterbox ratio/dw/dh nhất quán (nghịch đảo bbox OK)")
+    _exit_if(not ok_mask_bool, "pad_mask không phải bool.")
+    PASS("pad_mask là bool (True=pad).")
+    if not any_pad_true:
+        print("[WARN] Chưa thấy vùng pad=True trong các mẫu thử (ảnh có thể vừa khít).")
+    _exit_if(not any_word_mask_int, "word_mask (HF attention_mask) không phải int64/int32.")
+    PASS("word_mask dtype OK (HF: int).")
+    _exit_if(not ok_ratio, "Letterbox ratio/dw/dh không nhất quán (nghịch đảo bbox FAIL).")
+    PASS("Letterbox ratio/dw/dh nhất quán (nghịch đảo bbox OK).")
 
-    # ========== PASS 2: batch inference để test mask polarity & chọn [pr] ==========
+
+def check_collate(args):
     ds = RSVGDataset(
         images_path=args.images_path, anno_path=args.anno_path,
         imsize=args.imsize, transform=None, augment=False,
         split=args.split, testmode=False, max_query_len=40,
         splits_dir=args.splits_dir
     )
-    if args.limit>0:
-        from torch.utils.data import Subset
-        ds = Subset(ds, list(range(min(args.limit, len(ds)))))
+    subset = Subset(ds, list(range(min(args.limit or 16, len(ds)))))
+    loader = DataLoader(subset, batch_size=4, shuffle=False,
+                        num_workers=2, pin_memory=True, collate_fn=collate_fn)
+    images, pad_mask, word_id, word_mask, boxes = next(iter(loader))
 
-    loader = DataLoader(
-        ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-        collate_fn=collate_fn, drop_last=False
+    B, C, H, W = images.shape
+    _exit_if((H, W) != (args.imsize, args.imsize), "Ảnh sau letterbox không đúng kích thước imsize.")
+    _exit_if(pad_mask.dtype != torch.bool, "pad_mask batch không phải bool.")
+    _exit_if(word_id.dtype != torch.long, "word_id batch không phải long.")
+    _exit_if(word_mask.dtype != torch.long, "word_mask batch không phải long.")
+    _exit_if(boxes.dtype != torch.float, "boxes batch không phải float.")
+    PASS(f"Collate OK: images {tuple(images.shape)}, pad_mask {tuple(pad_mask.shape)}, word_id {tuple(word_id.shape)}, boxes {tuple(boxes.shape)}")
+
+
+def check_backbone(args):
+    ds = RSVGDataset(
+        images_path=args.images_path, anno_path=args.anno_path,
+        imsize=args.imsize, transform=None, augment=False,
+        split=args.split, testmode=False, max_query_len=40,
+        splits_dir=args.splits_dir
     )
+    subset = Subset(ds, list(range(min(args.limit or 8, len(ds)))))
+    loader = DataLoader(subset, batch_size=min(4, len(subset)), shuffle=False,
+                        num_workers=2, pin_memory=True, collate_fn=collate_fn)
 
+    images, pad_mask, *_ = next(iter(loader))
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    images = images.to(device).float()
+    pad_mask = pad_mask.to(device).bool()
+
+    bargs = build_args_shim(device.type)
+    backbone = build_backbone(bargs).to(device).eval()
+
+    _exit_if(getattr(backbone, "num_channels", None) != 2048,
+             f"backbone.num_channels != 2048 (got {getattr(backbone,'num_channels',None)})")
+    PASS("Backbone num_channels == 2048 (ResNet50).")
+
+    nt = NestedTensor(images, pad_mask)   # mask True=pad
+    outs, poss = backbone(nt)
+    _exit_if((not isinstance(outs, list)) or (not isinstance(poss, list)) or (len(outs) != len(poss)),
+             "Backbone không trả list (features, pos) matching.")
+
+    for i, (x, p) in enumerate(zip(outs, poss)):
+        t, m = x.tensors, x.mask
+        _exit_if(m.dtype != torch.bool, f"mask level {i} không phải bool.")
+        _exit_if(p.dtype != t.dtype, f"pos dtype khác feature dtype tại level {i}.")
+        _exit_if(m.shape[-2:] != t.shape[-2:], f"mask size != feature size tại level {i}.")
+    PASS("Backbone feature/mask/pos khớp shape & dtype tại tất cả levels.")
+
+    mx = max([x.mask.float().max().item() for x in outs])
+    mn = min([x.mask.float().min().item() for x in outs])
+    _exit_if(mx > 1.0 or mn < 0.0, "Mask sau nội suy không còn nhị phân?")
+    PASS("Mask sau nội suy vẫn nhị phân (nearest).")
+
+    # Freeze/training flags sanity (tùy cấu hình lr_backbone)
+    trainable = [(n, p.requires_grad) for n, p in backbone[0].body.named_parameters()]
+    any_l2l4_true = any((("layer2" in n) or ("layer3" in n) or ("layer4" in n)) and rg for n, rg in trainable)
+    any_c1l1_true = any((("conv1" in n) or ("bn1" in n) or ("layer1" in n)) and rg for n, rg in trainable)
+    _exit_if(not any_l2l4_true, "layer2/3/4 không trainable? Kiểm tra lr_backbone/train_backbone.")
+    _exit_if(any_c1l1_true, "conv1/bn1/layer1 đang trainable (mong muốn freeze).")
+    PASS("Freeze flags backbone hợp lý (layer2-4 trainable, conv1/bn1/layer1 frozen).")
+
+
+@torch.no_grad()
+def check_model_and_fusion(args):
+    """Chạy 1-2 batch qua MGVLF: kiểm polarity token pad + so sánh head([pr]=0) vs head(last)."""
+    ds = RSVGDataset(
+        images_path=args.images_path, anno_path=args.anno_path,
+        imsize=args.imsize, transform=None, augment=False,
+        split=args.split, testmode=False, max_query_len=40,
+        splits_dir=args.splits_dir
+    )
+    subset = Subset(ds, list(range(min(args.limit or 16, len(ds)))))
+    loader = DataLoader(subset, batch_size=min(8, len(subset)), shuffle=False,
+                        num_workers=2, pin_memory=True, collate_fn=collate_fn)
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     model = MGVLF(bert_model="bert-base-uncased", tunebert=True, args=build_args_shim(device.type))
     model.to(device).eval()
 
-    # Hook để lấy fusion output
     hook = HookFusionOut(model.vlmodel)
 
-    # Chạy 1-2 batch là đủ smoke
     batches = 0
     better_pr0 = 0
     total_cmp = 0
@@ -184,64 +249,82 @@ def main():
         word_mask = word_mask.to(device).long()
         boxes_gt_px = boxes_gt_px.to(device).float()
 
-        # Polarity check: HF 1=real, 0=pad -> key_pad should be (word_mask==0)
-        key_pad_should = (word_mask == 0)
-        # Khi forward, model sẽ tự tính key_pad và truyền sang VLFusion/CNN_MGVLF.
-        preds_norm = model(images, pad_mask, word_id, word_mask)  # (B,4) in [0,1]
-        # Sau forward, hook.last chứa output chuỗi fusion cuối
+        # Hints về polarity: HF 0=pad → key_pad=(word_mask==0)
+        pad_tokens = (word_mask == 0).sum().item()
+        print(f"[Batch {batches}] pad_tokens={pad_tokens}/{word_mask.numel()}")
+
+        # Forward model
+        preds_norm = model(images, pad_mask, word_id, word_mask)  # (B,4) in [0,1], xyxy
+        B, _, H, W = images.shape
+        scale = torch.tensor([W, H, W, H], device=device, dtype=preds_norm.dtype)
+        preds_px = _sanitize_xyxy_t(preds_norm * scale)
+        boxes_gt_px = _sanitize_xyxy_t(boxes_gt_px)
+
+        # Lấy fusion output qua hook
         fusion = hook.last
-        _exit_if(fusion is None, "Không lấy được fusion output từ hook (kiểm tra kiến trúc VLFusion)")
+        _exit_if(fusion is None, "Không lấy được fusion output từ hook (kiểm tra VLFusion).")
 
-        # Kiểm tra số pad tokens > 0 khi có padding trong câu
-        pad_tokens = key_pad_should.sum().item()
-        _exit_if(pad_tokens < 0, "Lỗi đếm pad tokens (không hợp lệ)")
-        if pad_tokens == 0:
-            print("[WARN] batch không có token pad (OK, nhưng nên có ở vài batch khác)")
-
-        # So sánh chọn token 0 vs -1 cho head (kỳ vọng token 0 tốt hơn hoặc không tệ hơn rõ rệt)
-        # fusion shape có thể (B,256,S) hoặc (B,S,256). Chuẩn với code hiện tại là (B,256,S).
+        # Chọn token 0 vs -1
         if fusion.dim() != 3:
             _exit_if(True, f"fusion output shape lạ: {tuple(fusion.shape)}")
 
-        if fusion.size(1) == 256:     # (B,256,S)
-            feat_pr0 = fusion[:, :, 0]          # (B,256)
-            feat_last = fusion[:, :, -1]        # (B,256)
-        elif fusion.size(2) == 256:   # (B,S,256)
-            feat_pr0 = fusion[:, 0, :]          # (B,256)
-            feat_last = fusion[:, -1, :]        # (B,256)
+        if fusion.size(1) == 256:           # (B,256,S)
+            feat_pr0  = fusion[:, :, 0]
+            feat_last = fusion[:, :, -1]
+        elif fusion.size(2) == 256:         # (B,S,256)
+            feat_pr0  = fusion[:, 0, :]
+            feat_last = fusion[:, -1, :]
         else:
             _exit_if(True, f"fusion hidden dim != 256: {tuple(fusion.shape)}")
 
-        # Dùng cùng box_head của model để so sánh
-        pred_pr0 = model.Prediction_Head(feat_pr0).sigmoid()
+        # Cùng head của model để so sánh
+        pred_pr0  = model.Prediction_Head(feat_pr0).sigmoid()
         pred_last = model.Prediction_Head(feat_last).sigmoid()
 
-        B, _, H, W = images.shape
-        scale = torch.tensor([W, H, W, H], device=images.device, dtype=pred_pr0.dtype)
-        pr0_px   = _sanitize_xyxy_t(pred_pr0 * scale)
-        last_px  = _sanitize_xyxy_t(pred_last * scale)
-        gt_px    = _sanitize_xyxy_t(boxes_gt_px)
+        pr0_px  = _sanitize_xyxy_t(pred_pr0 * scale)
+        last_px = _sanitize_xyxy_t(pred_last * scale)
 
-        iou0, _, _   = bbox_iou(pr0_px,  gt_px, x1y1x2y2=True)
-        iouLast,_, _ = bbox_iou(last_px, gt_px, x1y1x2y2=True)
+        iou0,   _, _ = bbox_iou(pr0_px,  boxes_gt_px, x1y1x2y2=True)
+        iouLast,_, _ = bbox_iou(last_px, boxes_gt_px, x1y1x2y2=True)
 
         better_pr0 += (iou0 >= iouLast).sum().item()
         total_cmp  += B
+        print(f"  median IoU: pr0={iou0.median().item():.3f} vs last={iouLast.median().item():.3f}")
 
-        print(f"[batch {batches}] median IoU pr@0={iou0.median().item():.3f} vs last={iouLast.median().item():.3f}")
-
-        if batches >= 2:   # đủ cho smoke
+        if batches >= 2:  # đủ cho smoke
             break
 
     hook.close()
 
-    # Kết luận
     if total_cmp > 0:
         ratio = better_pr0 / total_cmp
-        _exit_if(ratio < 0.5, f"[pr]@0 KHÔNG tốt hơn last token (tỉ lệ {ratio:.2f} < 0.5?) — kiểm tra chọn token cho head")
-        _ok(f"[pr] token @ index 0 cho head hợp lý (tỉ lệ tốt hơn/không tệ hơn rõ rệt: {ratio:.2f})")
+        _exit_if(ratio < 0.5, f"[pr]@index0 KHÔNG tốt hơn last token (tỉ lệ {ratio:.2f} < 0.5). Kiểm tra chọn token/head.")
+        PASS(f"[pr] token @ index 0 hợp lý (tỉ lệ pr0>=last: {ratio:.2f}).")
 
-    _ok("Smoke test hoàn tất")
+
+# ---------- main ----------
+def main():
+    parser = argparse.ArgumentParser("RSVG/MGVLF Smoke Test")
+    parser.add_argument("--images_path", type=str, required=True)
+    parser.add_argument("--anno_path",   type=str, required=True)
+    parser.add_argument("--splits_dir",  type=str, required=True)
+    parser.add_argument("--split",       type=str, default="val", choices=["train","val","test"])
+    parser.add_argument("--imsize",      type=int, default=640)
+    parser.add_argument("--limit",       type=int, default=32, help="số mẫu kiểm nhanh (0 = mặc định 16)")
+    parser.add_argument("--device",      type=str, default="cuda")
+    args = parser.parse_args()
+
+    # 1) Sanity IoU
+    sanity_iou_one()
+    # 2) Data pipeline
+    check_dataset_unit(args)
+    check_collate(args)
+    # 3) Backbone
+    check_backbone(args)
+    # 4) Model + Fusion [pr]
+    check_model_and_fusion(args)
+
+    print("\n✅ SMOKE TEST PASSED.\n")
 
 
 if __name__ == "__main__":
@@ -250,6 +333,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception:
-        print("\n=== Uncaught exception in smoke test ===")
+        print("\n=== Uncaught exception in smoke_test ===")
         traceback.print_exc()
         sys.exit(2)
