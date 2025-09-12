@@ -119,36 +119,52 @@ class CNN_MGVLF(nn.Module):
         wordFeature: (B,L,768), sentenceFeature: (B,768)
         """
         samples = NestedTensor(img, mask)
-        features, pos = self.backbone(samples)
+        outs = self.backbone(samples)
         
-        # Handle multi-scale vs single-scale input_proj
-        if isinstance(self.input_proj, nn.ModuleList):
-            # Multi-scale: project each feature map
-            feats_proj = []
-            for i, proj in enumerate(self.input_proj):
-                feat_tensor = features[i].tensors if hasattr(features[i], "tensors") else features[i]
-                feats_proj.append(proj(feat_tensor))
-            # Use the highest resolution (first in multi-scale)
-            featureMap4 = feats_proj[0]  # C3 level
-            mask4 = features[0].mask if hasattr(features[0], "mask") else mask
+        # ---- unpack backbone outputs to list of Tensor ----
+        if isinstance(outs, tuple):
+            feats_any = outs[0]  # (feats, pos) or (feats, masks, pos)
+            pos = outs[1] if len(outs) > 1 else None
         else:
-            # Single-scale: use C5 (last feature)
-            featureMap4, mask4 = features[-1].decompose()
-            featureMap4 = self.input_proj(featureMap4)  # (B,256,H,W)
-        
-        bs, c, h, w = featureMap4.shape
+            feats_any = outs
+            pos = None
 
-        # pyramid convs
-        conv6_1 = self.conv6_1(featureMap4)
+        # raw_feats keep original channels: [512, 1024, 2048] = (C3, C4, C5)
+        raw_feats = [f.tensors if hasattr(f, "tensors") else f for f in feats_any]
+        # ensure order C3,C4,C5
+        assert len(raw_feats) >= 3, f"expect at least 3 feature maps, got {len(raw_feats)}"
+        c3, c4, c5 = raw_feats[-3], raw_feats[-2], raw_feats[-1]
+
+        # proj_feats map each to hidden_dim=256 for transformer/fusion
+        if isinstance(self.input_proj, nn.ModuleList):
+            proj_feats = [proj(f) for proj, f in zip(self.input_proj, [c3, c4, c5])]
+        else:
+            # single-scale fallback: only C5
+            proj_feats = [self.input_proj(c5)]
+
+        # (optional) one-time debug
+        if not hasattr(self, "_once_dbg"):
+            print("[DBG][CNN] raw:", [t.shape[1] for t in [c3, c4, c5]], "| proj:", [t.shape[1] for t in proj_feats])
+            self._once_dbg = True
+
+        # Get masks from original features
+        mask4 = feats_any[-1].mask if hasattr(feats_any[-1], "mask") else mask
+        bs, _, h, w = c5.shape
+
+        # pyramid convs - CNN branch must take raw C5 (2048 ch)
+        conv6_1 = self.conv6_1(c5)
         conv6_2 = self.conv6_2(conv6_1)
         conv7_1 = self.conv7_1(conv6_2)
         conv7_2 = self.conv7_2(conv7_1)
         conv8_1 = self.conv8_1(conv7_2)
         conv8_2 = self.conv8_2(conv8_1)
 
+        # Use projected features for transformer/fusion (256 ch)
+        v_single = proj_feats[-1]  # P5 @ 256 ch
+        
         # flatten visual feats
-        conv5 = featureMap4  # Already projected to hidden_dim
-        fv1 = conv5.view(bs, c, -1)  # Use actual channel count 'c'
+        conv5 = v_single  # Use projected feature for transformer
+        fv1 = conv5.view(bs, conv5.shape[1], -1)  # Use actual channel count
         fv2 = conv6_2.view(bs, 256, -1)
         fv3 = conv7_2.view(bs, 256, -1)
         fv4 = conv8_2.view(bs, 256, -1)
@@ -159,7 +175,16 @@ class CNN_MGVLF(nn.Module):
         fv4_mask = self.get_mask(conv8_2, fv3_mask)
 
         # 2D positional encodings for each level (match dtype with tensors)
-        pos1 = pos[-1]
+        # Get pos from backbone output properly
+        if pos is None and len(outs) > 1:
+            pos = outs[1]
+        
+        if pos is not None:
+            pos1 = pos[-1] if isinstance(pos, list) else pos
+        else:
+            # Generate pos encoding if not available
+            pos1 = self.pos(NestedTensor(v_single, mask4)).to(v_single.dtype)
+        
         pos2 = self.pos(NestedTensor(conv6_2, fv2_mask)).to(conv6_2.dtype)
         pos3 = self.pos(NestedTensor(conv7_2, fv3_mask)).to(conv7_2.dtype)
         pos4 = self.pos(NestedTensor(conv8_2, fv4_mask)).to(conv8_2.dtype)
