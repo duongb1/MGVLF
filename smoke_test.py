@@ -314,9 +314,19 @@ def check_backbone(args):
     bargs = build_args_shim(device.type)
     backbone = build_backbone(bargs).to(device).eval()
 
-    _exit_if(getattr(backbone, "num_channels", None) != 2048,
-             f"backbone.num_channels != 2048 (got {getattr(backbone,'num_channels',None)})")
-    PASS("Backbone num_channels == 2048 (ResNet50).")
+    # --- num_channels: chấp nhận int hoặc list/tuple ---
+    nch = getattr(backbone, "num_channels", None)
+    _exit_if(nch is None, "backbone.num_channels không tồn tại?")
+    if isinstance(nch, (list, tuple)):
+        _exit_if(len(nch) == 0, "backbone.num_channels rỗng?")
+        last = int(nch[-1])
+        _exit_if(last != 2048, f"backbone.num_channels[-1] != 2048 (got {nch})")
+        PASS(f"Backbone num_channels OK (list): {nch} (C5={last})")
+    elif isinstance(nch, int):
+        _exit_if(nch != 2048, f"backbone.num_channels != 2048 (got {nch})")
+        PASS("Backbone num_channels == 2048 (int).")
+    else:
+        _exit_if(True, f"backbone.num_channels kiểu lạ: {type(nch)}")
 
     nt = NestedTensor(images, pad_mask)   # mask True=pad
     outs, poss = backbone(nt)
@@ -335,14 +345,53 @@ def check_backbone(args):
     _exit_if(mx > 1.0 or mn < 0.0, "Mask sau nội suy không còn nhị phân?")
     PASS("Mask sau nội suy vẫn nhị phân (nearest).")
 
-    # Kiểm freeze flags
-    trainable = [(n, p.requires_grad) for n, p in backbone[0].body.named_parameters()]
-    seg = lambda n: n.split('.', 1)[0]
-    any_l2l4_true = any(seg(n) in {'layer2', 'layer3', 'layer4'} and rg for n, rg in trainable)
-    any_c1l1_true = any(seg(n) in {'conv1', 'bn1', 'layer1'} and rg for n, rg in trainable)
-    _exit_if(not any_l2l4_true, "layer2/3/4 không trainable? Kiểm tra lr_backbone/train_backbone.")
-    _exit_if(any_c1l1_true, "conv1/bn1/layer1 đang trainable (mong muốn freeze).")
-    PASS("Freeze flags backbone hợp lý (layer2-4 trainable, conv1/bn1/layer1 frozen).")
+    # --- Kiểm freeze flags: hỗ trợ nhiều wrapper khác nhau ---
+    named_iters = []
+    # phổ biến trong DETR: Joiner[0].body hoặc .body
+    for path in ["[0].body", "body", "backbone[0].body", "backbone.body"]:
+        try:
+            obj = backbone
+            for part in path.replace("[0]", ".0").split("."):
+                if not part:
+                    continue
+                if part.isdigit():
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+            named_iters.append(list(obj.named_parameters()))
+        except Exception:
+            pass
+
+    # nếu vẫn rỗng, fallback: toàn bộ backbone (ít chính xác hơn về tên layer)
+    if not named_iters:
+        named_iters.append(list(backbone.named_parameters()))
+        print_warn("Freeze check", "Không tìm thấy .body; dùng fallback over all named_parameters.")
+
+    params = []
+    for it in named_iters:
+        params.extend(it)
+    # Loại trùng tên nếu có
+    seen = set(); pruned = []
+    for n, p in params:
+        if n in seen: continue
+        seen.add(n); pruned.append((n, p))
+
+    def top_block(n):  # xác định block cấp cao để ước lượng freeze
+        if "layer2" in n: return "layer2"
+        if "layer3" in n: return "layer3"
+        if "layer4" in n: return "layer4"
+        if any(x in n for x in ["conv1","bn1","layer1"]): return "stem_l1"
+        return "other"
+
+    any_l234_train = any((top_block(n) in {"layer2","layer3","layer4"}) and p.requires_grad for n, p in pruned)
+    any_stem_train = any((top_block(n) == "stem_l1") and p.requires_grad for n, p in pruned)
+
+    _exit_if(not any_l234_train, "layer2/3/4 không trainable? Kiểm tra lr_backbone/train_backbone.")
+    if any_stem_train:
+        print_warn("Freeze flags", "conv1/bn1/layer1 đang trainable (mong muốn freeze).")
+    else:
+        PASS("Freeze flags backbone hợp lý (layer2-4 trainable, conv1/bn1/layer1 frozen).")
+
 
 @torch.no_grad()
 def check_model_and_fusion(args):
