@@ -8,31 +8,7 @@ from utils.misc import (NestedTensor, nested_tensor_from_tensor_list)
 
 from models.backbone import build_backbone
 from models.transformer import build_vis_transformer, build_transformer, build_de
-from models.position_encoding import build_position_encoding
-
-
-# ===== 1D learned positional encoding for fusion sequence =====
-class Learned1DPos(nn.Module):
-    """
-    Return a (B, S, C) positional tensor for a sequence of length S.
-    Uses nn.Embedding with a large max_len; safe for variable S at runtime.
-    """
-    def __init__(self, d_model: int, max_len: int = 8192):
-        super().__init__()
-        self.pe = nn.Embedding(max_len, d_model)
-        self.d_model = d_model
-        self.max_len = max_len
-
-    def forward(self, x_bs_c: torch.Tensor) -> torch.Tensor:
-        """
-        x_bs_c: (B, S, C)  -> returns (B, S, C)
-        """
-        B, S, C = x_bs_c.shape
-        if S > self.max_len:
-            raise RuntimeError(f"S={S} exceeds max_len={self.max_len} of Learned1DPos")
-        idx = torch.arange(S, device=x_bs_c.device)  # (S,)
-        pos = self.pe(idx).unsqueeze(0).expand(B, S, -1)  # (B,S,C)
-        return pos
+from models.position_encoding import build_position_encoding, PositionEmbeddingLearned1D
 
 
 class CNN_MGVLF(nn.Module):
@@ -315,6 +291,6 @@ def build_CNN_MGVLF(args):
 def build_VLFusion(args):
     transformer = build_transformer(args)
     # dùng PE 1D học được ngay tại đây (không phụ thuộc build_position_encoding)
-    pos_1d = Learned1DPos(d_model=transformer.d_model, max_len=getattr(args, "max_fusion_len", 8192))
+    pos_1d = PositionEmbeddingLearned1D(d_model=transformer.d_model, max_len=getattr(args, "max_fusion_len", 8192))
     model = VLFusion(transformer, pos_1d)
     return model

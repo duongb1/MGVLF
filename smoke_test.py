@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-SMOKE TEST cho RSVG/MGVLF: Data pipeline + Backbone + Fusion [pr] token.
+SMOKE TEST hợp nhất cho RSVG/MGVLF: Data pipeline + Backbone + Fusion [pr] token.
 
-Chạy (ví dụ Kaggle):
+Ví dụ (Kaggle):
 python smoke_test.py \
   --images_path "/kaggle/input/dior-rsvg/DIOR_RSVG/JPEGImages" \
   --anno_path   "/kaggle/input/dior-rsvg/DIOR_RSVG/Annotations" \
@@ -12,14 +12,12 @@ python smoke_test.py \
   --split val \
   --imsize 640 \
   --limit 32 \
-  --device cuda
+  --device cuda \
+  --tiny_overfit true
 """
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # tránh cảnh báo fork của HF tokenizers
-
-from torchvision import transforms as T
-_SMOKE_TF = T.ToTensor()  # chỉ dùng cho smoke test
 
 import sys
 import math
@@ -27,23 +25,38 @@ import argparse
 import traceback
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+from torchvision import transforms as T
 
-# local repo imports
+# === import project modules (điều chỉnh nếu khác đường dẫn) ===
 from data_loader import RSVGDataset
-from utils.misc import collate_fn, NestedTensor
+from utils.misc import NestedTensor
 from utils.utils import bbox_iou
 from models.backbone import build_backbone
 from models.model import MGVLF
 
-
-# ---------- helpers ----------
+# ---------- utils in-file ----------
 def PASS(msg): print(f"[PASS] {msg}")
 def FAIL(msg): print(f"[FAIL] {msg}") or sys.exit(1)
 def _exit_if(cond, msg, code=1):
     if cond:
         FAIL(msg)
         sys.exit(code)
+
+def print_ok(name, extra=""):
+    print(f"[OK] {name}{(' - ' + extra) if extra else ''}")
+
+def print_warn(name, extra=""):
+    print(f"[WARN] {name}{(' - ' + extra) if extra else ''}")
+
+def check_env():
+    print("=== ENV ===")
+    print("Torch:", torch.__version__)
+    print("CUDA available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("CUDA device:", torch.cuda.get_device_name(0))
+    print_ok("Environment visible")
 
 def _sanitize_xyxy_t(x: torch.Tensor) -> torch.Tensor:
     x1 = torch.minimum(x[:, 0], x[:, 2])
@@ -90,7 +103,91 @@ def _to_tensor_imagenet(img_np: np.ndarray) -> torch.Tensor:
     std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     return (t - mean) / std
 
+# ---------- collate nội bộ (tránh xung đột với utils.misc.collate_fn) ----------
+def collate_basic(batch):
+    """
+    Kỳ vọng mỗi item trong batch là:
+      (img, pad_mask, word_id, word_mask, gt_box)
+    - img: np.ndarray HxWxC (RGB/BGR) hoặc torch.Tensor CxHxW
+    - pad_mask: np.ndarray HxW or torch.BoolTensor (True=pad)
+    - word_id: np.ndarray/torch.LongTensor (L,)
+    - word_mask: np.ndarray/torch.LongTensor (L,) with 1=real, 0=pad
+    - gt_box: np.ndarray/torch.FloatTensor (4,) theo canvas [x1,y1,x2,y2]
+    """
+    import numpy as np
+    import torch
 
+    imgs, masks, word_ids, word_masks, gt_boxes = [], [], [], [], []
+
+    def to_img_tensor(x):
+        if isinstance(x, torch.Tensor):
+            t = x
+            if t.ndim == 3 and t.shape[0] in (1,3):  # C,H,W
+                return t.float()
+            if t.ndim == 3 and t.shape[-1] in (1,3):  # H,W,C
+                return t.permute(2,0,1).float()
+            raise RuntimeError(f"Unexpected image tensor shape: {t.shape}")
+        elif isinstance(x, np.ndarray):
+            if x.ndim == 3 and x.shape[-1] in (1,3):  # H,W,C
+                t = torch.from_numpy(x).permute(2,0,1).contiguous().float()
+                return t
+            if x.ndim == 3 and x.shape[0] in (1,3):  # C,H,W
+                return torch.from_numpy(x).contiguous().float()
+            raise RuntimeError(f"Unexpected image array shape: {x.shape}")
+        else:
+            raise TypeError(f"img type must be tensor or ndarray, got {type(x)}")
+
+    def to_mask_tensor(x):
+        if isinstance(x, torch.Tensor):
+            if x.dtype != torch.bool:
+                x = x != 0
+            return x.bool()
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).bool()
+        else:
+            raise TypeError(f"mask type must be tensor or ndarray, got {type(x)}")
+
+    def to_long_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x.long()
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).long()
+        else:
+            raise TypeError(f"long tensor expects ndarray/tensor, got {type(x)}")
+
+    def to_float_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x.float()
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).float()
+        else:
+            raise TypeError(f"float tensor expects ndarray/tensor, got {type(x)}")
+
+    for item in batch:
+        img, pad_mask, wid, wmask, gt = item  # điều chỉnh nếu thứ tự khác
+        imgs.append(to_img_tensor(img))
+        masks.append(to_mask_tensor(pad_mask))
+        word_ids.append(to_long_tensor(wid))
+        word_masks.append(to_long_tensor(wmask))
+        gt_boxes.append(to_float_tensor(gt))
+
+    imgs = torch.stack(imgs, dim=0)       # (B,C,H,W)
+    masks = torch.stack(masks, dim=0)     # (B,H,W) True=pad
+    word_id = torch.stack(word_ids, dim=0)        # (B,L)
+    word_mask = torch.stack(word_masks, dim=0)    # (B,L) 1=real,0=pad
+    gt_boxes = torch.stack(gt_boxes, dim=0)       # (B,4)
+
+    if not hasattr(collate_basic, "_once"):
+        print("[COLLATE] imgs", imgs.shape, imgs.dtype)
+        print("[COLLATE] masks", masks.shape, masks.dtype)
+        print("[COLLATE] word_id", word_id.shape, word_id.dtype)
+        print("[COLLATE] word_mask unique:", sorted(torch.unique(word_mask).tolist()))
+        print("[COLLATE] gt_boxes", gt_boxes.shape, gt_boxes.dtype)
+        collate_basic._once = True
+
+    return imgs, masks, word_id, word_mask, gt_boxes
+
+# ---------- sanity ----------
 @torch.no_grad()
 def sanity_iou_one():
     gt = torch.tensor([[10,10,100,100],[0,0,1,1],[5,20,50,60]], dtype=torch.float32)
@@ -100,60 +197,37 @@ def sanity_iou_one():
         FAIL(f"IoU(pred=GT) != 1.0 (got {val:.6f})")
     PASS("IoU(pred=GT) == 1.0")
 
-
 # ---------- arg shim cho backbone/model ----------
 def build_args_shim(device: str):
     class A: pass
     a = A()
-    # ---- core ----
+    # core
     a.device = device
     a.backbone = 'resnet50'
     a.img_pe_type = 'sine'
     a.dilation = False
     a.masks = True
     a.hidden_dim = 256
-
-    # ---- transformer defaults (DETR-style) ----
+    # transformer defaults (DETR-style)
     a.dropout = 0.1
     a.nheads = 8
     a.dim_feedforward = 2048
-    a.enc_layers = 6          # encoder layers cho EN & VLFusion
-    a.dec_layers = 1          # decoder layers cho DE (refine 1 lượt)
+    a.enc_layers = 6
+    a.dec_layers = 1
     a.pre_norm = False
     a.activation = 'relu'
     a.return_intermediate_dec = False
-    a.num_queries = 100       # nếu builder có dùng, không hại
-
-    # ---- lr/freeze ----
+    a.num_queries = 100
+    # lr/freeze
     a.lr = 1e-4
     a.lr_backbone = 1e-5
     a.lr_drop = 60
     a.lr_dec = 0.1
-
-    # ---- fusion PE ----
+    # fusion PE
     a.fusion_pe_max_len = 4096
-
-    # ---- no extra pretrain here ----
+    # no extra pretrain
     a.pretrain = ""
     return a
-
-
-
-# ---------- hook lấy output chuỗi cuối của VLFusion ----------
-class HookFusionOut:
-    def __init__(self, vlmodel):
-        self.last = None
-        self.h = vlmodel.transformer.register_forward_hook(self._hook)
-
-    def _hook(self, module, inp, out):
-        try:
-            self.last = out[-1].detach()
-        except Exception:
-            self.last = out.detach()
-
-    def close(self):
-        if self.h: self.h.remove()
-
 
 # ---------- checks ----------
 def check_dataset_unit(args):
@@ -172,7 +246,11 @@ def check_dataset_unit(args):
     any_word_mask_int = True
 
     for i in range(n):
-        img, pad_mask, word_id, word_mask, bbox_px, ratio, dw, dh, *_ = ds_t[i]
+        item = ds_t[i]
+        # Hỗ trợ cả hai kiểu trả về (có thể nhiều hơn do bạn mở rộng):
+        img, pad_mask, word_id, word_mask, bbox_px = item[:5]
+        ratio, dw, dh = item[5:8]
+
         ok_mask_bool &= (pad_mask.dtype == np.bool_)
         any_pad_true |= bool(pad_mask.any())
         any_word_mask_int &= (word_mask.dtype in (np.int64, np.int32))
@@ -194,12 +272,7 @@ def check_dataset_unit(args):
     _exit_if(not ok_ratio, "Letterbox ratio/dw/dh không nhất quán (nghịch đảo bbox FAIL).")
     PASS("Letterbox ratio/dw/dh nhất quán (nghịch đảo bbox OK).")
 
-
 def check_collate(args):
-    import torch
-    from torch.utils.data import DataLoader
-    from data_loader import RSVGDataset
-
     ds = RSVGDataset(
         images_path=args.images_path,
         anno_path=args.anno_path,
@@ -209,9 +282,9 @@ def check_collate(args):
         max_query_len=40,
         bert_model="bert-base-uncased",
         splits_dir=args.splits_dir,
-        transform=_SMOKE_TF,  # <— thêm
+        transform=T.ToTensor(),  # giữ đúng luồng train
     )
-    loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)  # <— bỏ collate_fn
+    loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)  # collate mặc định của dataset
 
     images, pad_mask, word_id, word_mask, boxes = next(iter(loader))
     assert isinstance(images, torch.Tensor) and images.dim() == 4
@@ -219,20 +292,19 @@ def check_collate(args):
     assert isinstance(word_id, torch.Tensor) and word_id.dtype == torch.long
     assert isinstance(word_mask, torch.Tensor) and word_mask.dtype == torch.long
     assert isinstance(boxes, torch.Tensor) and boxes.dtype == torch.float32
-    print(f"[PASS] Collate OK: images {tuple(images.shape)}, pad_mask {tuple(pad_mask.shape)}, "
-          f"word_id {tuple(word_id.shape)}, boxes {tuple(boxes.shape)}")
-
+    PASS(f"Collate OK: images {tuple(images.shape)}, pad_mask {tuple(pad_mask.shape)}, "
+         f"word_id {tuple(word_id.shape)}, boxes {tuple(boxes.shape)}")
 
 def check_backbone(args):
     ds = RSVGDataset(
         images_path=args.images_path, anno_path=args.anno_path,
-        imsize=args.imsize, transform=_to_tensor_imagenet,  # <--- CHUYỂN ẢNH SANG TENSOR
+        imsize=args.imsize, transform=_to_tensor_imagenet,
         augment=False, split=args.split, testmode=False, max_query_len=40,
         splits_dir=args.splits_dir
     )
     subset = Subset(ds, list(range(min(args.limit or 8, len(ds)))))
     loader = DataLoader(subset, batch_size=min(4, len(subset)), shuffle=False,
-                        num_workers=0, pin_memory=True, collate_fn=collate_fn)
+                        num_workers=0, pin_memory=True, collate_fn=collate_basic)
 
     images, pad_mask, *_ = next(iter(loader))
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -263,32 +335,18 @@ def check_backbone(args):
     _exit_if(mx > 1.0 or mn < 0.0, "Mask sau nội suy không còn nhị phân?")
     PASS("Mask sau nội suy vẫn nhị phân (nearest).")
 
+    # Kiểm freeze flags
     trainable = [(n, p.requires_grad) for n, p in backbone[0].body.named_parameters()]
-
-    seg = lambda n: n.split('.', 1)[0]  # only the top-level block name
-
+    seg = lambda n: n.split('.', 1)[0]
     any_l2l4_true = any(seg(n) in {'layer2', 'layer3', 'layer4'} and rg for n, rg in trainable)
     any_c1l1_true = any(seg(n) in {'conv1', 'bn1', 'layer1'} and rg for n, rg in trainable)
-    
-    # Optional debug to see what's trainable
-    print("[DBG init trainable]", [n for n, rg in trainable if rg and seg(n) in {'conv1','bn1','layer1'}])
-    print("[DBG l234 trainable]", [n for n, rg in trainable if rg and seg(n) in {'layer2','layer3','layer4'}][:10])
-    
     _exit_if(not any_l2l4_true, "layer2/3/4 không trainable? Kiểm tra lr_backbone/train_backbone.")
     _exit_if(any_c1l1_true, "conv1/bn1/layer1 đang trainable (mong muốn freeze).")
     PASS("Freeze flags backbone hợp lý (layer2-4 trainable, conv1/bn1/layer1 frozen).")
 
-
 @torch.no_grad()
 def check_model_and_fusion(args):
-    import torch
-    from torch.utils.data import DataLoader
-    from data_loader import RSVGDataset
-    from models.model import MGVLF
-    from torchvision import transforms as T
-
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-
     ds = RSVGDataset(
         images_path=args.images_path,
         anno_path=args.anno_path,
@@ -298,7 +356,7 @@ def check_model_and_fusion(args):
         max_query_len=40,
         bert_model="bert-base-uncased",
         splits_dir=args.splits_dir,
-        transform=T.ToTensor(),  # giữ đúng luồng train (không collate_fn)
+        transform=T.ToTensor(),
     )
     bs = min(4, max(1, getattr(args, "limit", 4)))
     loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=0)
@@ -343,7 +401,7 @@ def check_model_and_fusion(args):
 
         # visu + fusion
         fv = model.visumodel(images, pad_mask, word_mask, fl, pool)      # (B,256,H,W)
-        fusion = model.vlmodel(fv, fl, word_mask)                         # kỳ vọng (B,256,S)
+        fusion = model.vlmodel(fv, fl, word_mask)                         # kỳ vọng (B,256,S) hoặc (B,S,256)/(B,256)
 
         # ----- Chuẩn hoá shape -----
         if fusion.dim() == 2 and fusion.size(1) == 256:
@@ -360,7 +418,7 @@ def check_model_and_fusion(args):
             raise AssertionError(f"[FAIL] Fusion dim lạ: {fusion.dim()}")
 
         B, C, S = fusion.shape
-        print(f"[PASS] Fusion shape chuẩn hoá: (B,256,S) với S={S}")
+        PASS(f"Fusion shape chuẩn hoá: (B,256,S) với S={S}")
 
         # ----- Kiểm [pr]@0 và mask -----
         Lv = fv.view(B, 256, -1).shape[2]
@@ -373,27 +431,46 @@ def check_model_and_fusion(args):
         assert (~pr_pad.squeeze(1)).all(), "[FAIL] [pr] token bị pad"
         if fused_mask.shape[1] == S:
             assert (~fused_mask[:, 0]).all(), "[FAIL] [pr]@0 bị pad"
-            print("[PASS] [pr] ở đầu và không bị pad")
+            PASS("[pr] ở đầu và không bị pad")
         else:
-            print(f"[WARN] S={S} != (1+Lv+L)={fused_mask.shape[1]}. Bỏ qua check khớp chiều dài chuỗi.")
+            print_warn("Fused length mismatch", f"S={S} vs (1+Lv+L)={fused_mask.shape[1]} — bỏ qua check khớp chiều dài.")
 
         # ----- Head dùng token 0 -> (B,4) trong [0,1] -----
         feat_pr = fusion[:, :, 0]                                          # (B,256)
         head_out = model.box_head(feat_pr).sigmoid()
         assert head_out.shape == (B, 4), f"[FAIL] Box head output {tuple(head_out.shape)} khác (B,4)"
         assert (head_out >= 0).all() and (head_out <= 1).all(), "[FAIL] Box head không nằm [0,1]"
-        print("[PASS] Head dùng token 0 ([pr]) → (B,4) ∈ [0,1]")
+        PASS("Head dùng token 0 ([pr]) → (B,4) ∈ [0,1]")
 
         # E2E
         out_full = model(images, pad_mask, word_id, word_mask)
         assert out_full.shape == (B,4), f"[FAIL] model(...) phải trả (B,4), nhận {tuple(out_full.shape)}"
-        print("[PASS] Forward end-to-end trả (B,4)")
+        PASS("Forward end-to-end trả (B,4)")
 
+def tiny_overfit_step(model, batch, device):
+    imgs, masks, word_id, word_mask, gt_boxes = batch
+    imgs, masks = imgs.to(device), masks.to(device)
+    word_id, word_mask = word_id.to(device), word_mask.to(device)
+    gt_boxes = gt_boxes.to(device)  # expected pixel x1,y1,x2,y2 trên canvas
 
+    out = model(imgs, masks, word_id, word_mask)  # (B,4) normalized [0,1]
+    B, C, H, W = imgs.shape
+    cx = out[:, 0] * W
+    cy = out[:, 1] * H
+    ww = out[:, 2] * W
+    hh = out[:, 3] * H
+    x1 = cx - ww / 2
+    y1 = cy - hh / 2
+    x2 = cx + ww / 2
+    y2 = cy + hh / 2
+    pred_boxes = torch.stack([x1, y1, x2, y2], dim=1)
+
+    loss = (pred_boxes - gt_boxes).abs().mean()
+    return pred_boxes, loss
 
 # ---------- main ----------
 def main():
-    parser = argparse.ArgumentParser("RSVG/MGVLF Smoke Test")
+    parser = argparse.ArgumentParser("RSVG/MGVLF Smoke Test (merged)")
     parser.add_argument("--images_path", type=str, required=True)
     parser.add_argument("--anno_path",   type=str, required=True)
     parser.add_argument("--splits_dir",  type=str, required=True)
@@ -401,16 +478,64 @@ def main():
     parser.add_argument("--imsize",      type=int, default=640)
     parser.add_argument("--limit",       type=int, default=32, help="số mẫu kiểm nhanh (0 = mặc định 16)")
     parser.add_argument("--device",      type=str, default="cuda")
+    parser.add_argument("--tiny_overfit", type=lambda x: str(x).lower() in ["1","true","yes"], default=False)
     args = parser.parse_args()
 
+    check_env()
     sanity_iou_one()
-    check_dataset_unit(args)   # testmode=True, không cần transform
-    check_collate(args)        # dùng _to_tensor_imagenet
-    check_backbone(args)       # dùng _to_tensor_imagenet
-    check_model_and_fusion(args)  # dùng _to_tensor_imagenet
+    check_dataset_unit(args)
+    check_collate(args)
+    check_backbone(args)
+    check_model_and_fusion(args)
+
+    if args.tiny_overfit:
+        print("\n[INFO] Tiny overfit 1 bước để sanity loss ↓")
+        # Lấy 1 batch bằng pipeline ToTensor (giống train)
+        ds = RSVGDataset(
+            images_path=args.images_path,
+            anno_path=args.anno_path,
+            imsize=args.imsize,
+            split=args.split,
+            testmode=False,
+            max_query_len=40,
+            bert_model="bert-base-uncased",
+            splits_dir=args.splits_dir,
+            transform=T.ToTensor(),
+        )
+        loader = DataLoader(ds, batch_size=min(4, len(ds)), shuffle=True, num_workers=0)
+        imgs, masks, word_id, word_mask, gt_boxes = next(iter(loader))
+
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        # args shim cho model
+        class A: pass
+        a = A()
+        a.device = device.type
+        a.backbone = "resnet50"
+        a.masks = True
+        a.dilation = False
+        a.hidden_dim = 256
+        a.dropout = 0.1
+        a.nheads = 8
+        a.dim_feedforward = 2048
+        a.enc_layers = 6
+        a.dec_layers = 1
+        a.pre_norm = False
+        a.lr_backbone = 1e-4
+        a.img_pe_type = "sine"
+        a.max_query_len = 40
+        a.max_fusion_len = 8192
+        a.pretrain = ""
+
+        model = MGVLF(bert_model="bert-base-uncased", tunebert=True, args=a).to(device)
+        model.train()
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        batch = (imgs, masks, word_id, word_mask, gt_boxes)
+        _, loss0 = tiny_overfit_step(model, batch, device)
+        opt.zero_grad(); loss0.backward(); nn.utils.clip_grad_norm_(model.parameters(), 0.1); opt.step()
+        _, loss1 = tiny_overfit_step(model, batch, device)
+        print_ok("Tiny overfit step", f"loss0={loss0.item():.4f} -> loss1={loss1.item():.4f}")
 
     print("\n✅ SMOKE TEST PASSED.\n")
-
 
 if __name__ == "__main__":
     try:

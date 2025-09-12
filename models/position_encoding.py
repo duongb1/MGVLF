@@ -50,32 +50,25 @@ class PositionEmbeddingSine(nn.Module):
 
 class PositionEmbeddingLearned1D(nn.Module):
     """
-    Learned 1D positional embedding cho CHUỖI (fusion) – dùng cho [vis | word | pr].
-    Nhận x dạng (B,C,S) hoặc (B,S,C), trả về pos dạng (B,S,C).
+    Return a (B, S, C) positional tensor for a sequence of length S.
+    Uses nn.Embedding with a large max_len; safe for variable S at runtime.
     """
-    def __init__(self, num_pos_feats=256, max_len=2048):
+    def __init__(self, d_model: int, max_len: int = 8192):
         super().__init__()
-        self.embed = nn.Embedding(max_len, num_pos_feats)
-        nn.init.uniform_(self.embed.weight)
+        self.pe = nn.Embedding(max_len, d_model)
+        self.d_model = d_model
+        self.max_len = max_len
 
-    def forward(self, x: torch.Tensor):
-        if x.dim() != 3:
-            raise ValueError("Expect (B,C,S) hoặc (B,S,C) cho learned1d PE")
-        B = x.size(0)
-        C = self.embed.embedding_dim  # 256 mặc định
-
-        # Suy luận S an toàn theo kích thước ẩn C
-        if x.shape[-1] == C:   # (B, S, C)
-            S = x.shape[1]
-        elif x.shape[1] == C:  # (B, C, S)
-            S = x.shape[2]
-        else:
-            # fallback: coi chiều cuối là S
-            S = x.shape[-1]
-
-        S = min(S, self.embed.num_embeddings)
-        pos = self.embed(torch.arange(S, device=x.device))  # (S, C)
-        return pos.unsqueeze(0).expand(B, S, -1)            # (B, S, C)
+    def forward(self, x_bs_c: torch.Tensor) -> torch.Tensor:
+        """
+        x_bs_c: (B, S, C)  -> returns (B, S, C)
+        """
+        B, S, C = x_bs_c.shape
+        if S > self.max_len:
+            raise RuntimeError(f"S={S} exceeds max_len={self.max_len} of Learned1DPos")
+        idx = torch.arange(S, device=x_bs_c.device)  # (S,)
+        pos = self.pe(idx).unsqueeze(0).expand(B, S, -1)  # (B,S,C)
+        return pos
 
 
 class PositionEmbeddingLearned2D(nn.Module):
@@ -113,7 +106,7 @@ def build_position_encoding(args, position_embedding):
         )
     elif position_embedding in ('learned1d', 'fusion1d'):
         return PositionEmbeddingLearned1D(
-            num_pos_feats=args.hidden_dim,
+            d_model=args.hidden_dim,
             max_len=getattr(args, 'fusion_pe_max_len', 4096),
         )
     else:
