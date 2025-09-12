@@ -13,14 +13,6 @@ python smoke_test.py \
   --imsize 640 \
   --limit 32 \
   --device cuda
-
-Kiểm tra:
-- Dataset: pad_mask (bool, True=pad), letterbox ratio/dw/dh nghịch đảo được bbox,
-           tokenizer masks dtype, collate shapes/dtypes.
-- Backbone: num_channels, mask nội suy (bool), pos dtype khớp feature, freeze flags hợp lý.
-- Fusion: hook output chuỗi, so head trên token 0 vs token -1 (kỳ vọng token 0 tốt hơn/không tệ hơn),
-          kiểm tra pad token count (HF: 0=pad → key_pad=(word_mask==0)).
-- Sanity: IoU(pred=GT)=1.0
 """
 
 import os
@@ -35,7 +27,7 @@ from torch.utils.data import DataLoader, Subset
 # local repo imports
 from data_loader import RSVGDataset
 from utils.misc import collate_fn, NestedTensor
-from utils.utils import bbox_iou  # dùng IoU torch
+from utils.utils import bbox_iou
 from models.backbone import build_backbone
 from models.model import MGVLF
 
@@ -54,6 +46,38 @@ def _sanitize_xyxy_t(x: torch.Tensor) -> torch.Tensor:
     x2 = torch.maximum(x[:, 0], x[:, 2])
     y2 = torch.maximum(x[:, 1], x[:, 3])
     return torch.stack([x1, y1, x2, y2], dim=1)
+
+def _split_ratio(r):
+    """
+    Trả về (rx, ry) dưới dạng float, chấp nhận:
+      - float / int
+      - tuple/list có 1 hoặc 2 phần tử
+      - numpy.ndarray: 0-d (scalar) hoặc có >=2 phần tử
+    """
+    import numpy as _np
+    # tuple/list
+    if isinstance(r, (tuple, list)):
+        if len(r) >= 2:
+            return float(r[0]), float(r[1])
+        elif len(r) == 1:
+            v = float(r[0]); return v, v
+        else:
+            return 1.0, 1.0
+    # numpy array
+    if isinstance(r, _np.ndarray):
+        if r.ndim == 0:                  # scalar array
+            v = float(r)
+            return v, v
+        r = r.reshape(-1)
+        if r.size >= 2:
+            return float(r[0]), float(r[1])
+        elif r.size == 1:
+            v = float(r[0]); return v, v
+        else:
+            return 1.0, 1.0
+    # số thường
+    v = float(r)
+    return v, v
 
 
 @torch.no_grad()
@@ -77,7 +101,7 @@ def build_args_shim(device: str):
     a.masks = True           # cần intermediate layers
     # dims
     a.hidden_dim = 256
-    # train flags (không dùng train ở đây, nhưng backbone sẽ set freeze dựa vào lr_backbone)
+    # train flags (không train ở đây, nhưng backbone set freeze dựa vào lr_backbone)
     a.lr = 1e-4
     a.lr_backbone = 1e-5
     a.lr_drop = 60
@@ -130,10 +154,10 @@ def check_dataset_unit(args):
         any_word_mask_int &= (word_mask.dtype in (np.int64, np.int32))
 
         bx = bbox_px.astype(np.float32)
-        if isinstance(ratio, (tuple, list, np.ndarray)):
-            rx, ry = float(ratio[0]), float(ratio[1])
-        else:
-            rx = ry = float(ratio)
+        rx, ry = _split_ratio(ratio)
+        dw = float(dw); dh = float(dh)
+
+        # nghịch đảo rồi forward lại
         inv = np.array([(bx[0]-dw)/rx, (bx[1]-dh)/ry, (bx[2]-dw)/rx, (bx[3]-dh)/ry], dtype=np.float32)
         fwd = np.array([inv[0]*rx+dw, inv[1]*ry+dh, inv[2]*rx+dw, inv[3]*ry+dh], dtype=np.float32)
         ok_ratio &= np.allclose(fwd, bx, atol=1e-3)
