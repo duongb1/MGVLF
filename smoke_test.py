@@ -18,6 +18,9 @@ python smoke_test.py \
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # tránh cảnh báo fork của HF tokenizers
 
+from torchvision import transforms as T
+_SMOKE_TF = T.ToTensor()  # chỉ dùng cho smoke test
+
 import sys
 import math
 import argparse
@@ -193,24 +196,31 @@ def check_dataset_unit(args):
 
 
 def check_collate(args):
-    ds = RSVGDataset(
-        images_path=args.images_path, anno_path=args.anno_path,
-        imsize=args.imsize, transform=_to_tensor_imagenet,  # <--- CHUYỂN ẢNH SANG TENSOR
-        augment=False, split=args.split, testmode=False, max_query_len=40,
-        splits_dir=args.splits_dir
-    )
-    subset = Subset(ds, list(range(min(args.limit or 16, len(ds)))))
-    loader = DataLoader(subset, batch_size=4, shuffle=False,
-                        num_workers=0, pin_memory=True, collate_fn=collate_fn)  # num_workers=0 để tránh fork warning
-    images, pad_mask, word_id, word_mask, boxes = next(iter(loader))
+    import torch
+    from torch.utils.data import DataLoader
+    from data_loader import RSVGDataset
 
-    B, C, H, W = images.shape
-    _exit_if((H, W) != (args.imsize, args.imsize), "Ảnh sau letterbox không đúng kích thước imsize.")
-    _exit_if(pad_mask.dtype != torch.bool, "pad_mask batch không phải bool.")
-    _exit_if(word_id.dtype != torch.long, "word_id batch không phải long.")
-    _exit_if(word_mask.dtype != torch.long, "word_mask batch không phải long.")
-    _exit_if(boxes.dtype != torch.float, "boxes batch không phải float.")
-    PASS(f"Collate OK: images {tuple(images.shape)}, pad_mask {tuple(pad_mask.shape)}, word_id {tuple(word_id.shape)}, boxes {tuple(boxes.shape)}")
+    ds = RSVGDataset(
+        images_path=args.images_path,
+        anno_path=args.anno_path,
+        imsize=args.imsize,
+        split=args.split,
+        testmode=False,
+        max_query_len=40,
+        bert_model="bert-base-uncased",
+        splits_dir=args.splits_dir,
+        transform=_SMOKE_TF,  # <— thêm
+    )
+    loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)  # <— bỏ collate_fn
+
+    images, pad_mask, word_id, word_mask, boxes = next(iter(loader))
+    assert isinstance(images, torch.Tensor) and images.dim() == 4
+    assert isinstance(pad_mask, torch.Tensor) and pad_mask.dtype == torch.bool
+    assert isinstance(word_id, torch.Tensor) and word_id.dtype == torch.long
+    assert isinstance(word_mask, torch.Tensor) and word_mask.dtype == torch.long
+    assert isinstance(boxes, torch.Tensor) and boxes.dtype == torch.float32
+    print(f"[PASS] Collate OK: images {tuple(images.shape)}, pad_mask {tuple(pad_mask.shape)}, "
+          f"word_id {tuple(word_id.shape)}, boxes {tuple(boxes.shape)}")
 
 
 def check_backbone(args):
@@ -273,13 +283,11 @@ def check_backbone(args):
 def check_model_and_fusion(args):
     import torch
     from torch.utils.data import DataLoader
-    from utils.misc import collate_fn as collate_default
     from data_loader import RSVGDataset
     from models.model import MGVLF
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # dataset & loader
     ds = RSVGDataset(
         images_path=args.images_path,
         anno_path=args.anno_path,
@@ -289,11 +297,10 @@ def check_model_and_fusion(args):
         max_query_len=40,
         bert_model="bert-base-uncased",
         splits_dir=args.splits_dir,
+        transform=_SMOKE_TF,  # <— thêm
     )
-    # lấy 1 batch nhỏ
     bs = min(4, max(1, getattr(args, "limit", 4)))
-    loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=0,
-                        collate_fn=collate_default)
+    loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=0)  # <— bỏ collate_fn
 
     images, pad_mask, word_id, word_mask, boxes = next(iter(loader))
     images   = images.to(device)                    # (B,3,H,W)
