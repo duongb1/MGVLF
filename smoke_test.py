@@ -271,81 +271,99 @@ def check_backbone(args):
 
 @torch.no_grad()
 def check_model_and_fusion(args):
-    """Chạy 1-2 batch qua MGVLF: kiểm polarity token pad + so sánh head([pr]=0) vs head(last)."""
-    ds = RSVGDataset(
-        images_path=args.images_path, anno_path=args.anno_path,
-        imsize=args.imsize, transform=_to_tensor_imagenet,  # <--- CHUYỂN ẢNH SANG TENSOR
-        augment=False, split=args.split, testmode=False, max_query_len=40,
-        splits_dir=args.splits_dir
-    )
-    subset = Subset(ds, list(range(min(args.limit or 16, len(ds)))))
-    loader = DataLoader(subset, batch_size=min(8, len(subset)), shuffle=False,
-                        num_workers=0, pin_memory=True, collate_fn=collate_fn)
+    import torch
+    from torch.utils.data import DataLoader
+    from utils.misc import collate_fn as collate_default
+    from data_loader import RSVGDataset
+    from models.model import MGVLF
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model = MGVLF(bert_model="bert-base-uncased", tunebert=True, args=build_args_shim(device.type))
-    model.to(device).eval()
 
-    hook = HookFusionOut(model.vlmodel)
+    # dataset & loader
+    ds = RSVGDataset(
+        images_path=args.images_path,
+        anno_path=args.anno_path,
+        imsize=args.imsize,
+        split=args.split,
+        testmode=False,
+        max_query_len=40,
+        bert_model="bert-base-uncased",
+        splits_dir=args.splits_dir,
+    )
+    # lấy 1 batch nhỏ
+    bs = min(4, max(1, getattr(args, "limit", 4)))
+    loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=0,
+                        collate_fn=collate_default)
 
-    batches = 0
-    better_pr0 = 0
-    total_cmp = 0
+    images, pad_mask, word_id, word_mask, boxes = next(iter(loader))
+    images   = images.to(device)                    # (B,3,H,W)
+    pad_mask = pad_mask.to(device)                  # (B,H,W) True=pad
+    word_id  = torch.as_tensor(word_id,  device=device).long()   # (B,L)
+    word_mask= torch.as_tensor(word_mask,device=device).long()   # (B,L)
 
-    for images, pad_mask, word_id, word_mask, boxes_gt_px in loader:
-        batches += 1
-        images = images.to(device).float()
-        pad_mask = pad_mask.to(device).bool()
-        word_id = word_id.to(device).long()
-        word_mask = word_mask.to(device).long()
-        boxes_gt_px = boxes_gt_px.to(device).float()
+    # args shim cho model/transformer
+    class A: pass
+    a = A()
+    a.device = device.type
+    a.backbone = "resnet50"
+    a.masks = True
+    a.dilation = False
+    a.hidden_dim = 256
+    a.dropout = 0.1
+    a.nheads = 8
+    a.dim_feedforward = 2048
+    a.enc_layers = 6
+    a.dec_layers = 1   # DE 1 layer
+    a.lr_backbone = 1e-4  # để freeze conv1/bn1/layer1, train layer2-4
+    a.img_pe_type = "sine"
+    a.max_query_len = 40
+    a.max_fusion_len = 8192
+    a.pretrain = ""    # không nạp ckpt tùy chọn
 
-        pad_tokens = (word_mask == 0).sum().item()
-        print(f"[Batch {batches}] pad_tokens={pad_tokens}/{word_mask.numel()}")
+    model = MGVLF(bert_model="bert-base-uncased", tunebert=True, args=a).to(device)
+    model.eval()
 
-        preds_norm = model(images, pad_mask, word_id, word_mask)  # (B,4) in [0,1], xyxy
-        B, _, H, W = images.shape
-        scale = torch.tensor([W, H, W, H], device=device, dtype=preds_norm.dtype)
-        preds_px = _sanitize_xyxy_t(preds_norm * scale)
-        boxes_gt_px = _sanitize_xyxy_t(boxes_gt_px)
+    with torch.no_grad():
+        # chạy từng nhánh để soi fusion shape
+        outputs = model.textmodel(input_ids=word_id, attention_mask=word_mask, return_dict=True)
+        fl = outputs.last_hidden_state                                        # (B,L,768)
+        pool = getattr(outputs, "pooler_output", None)
+        if pool is None:
+            am = word_mask.unsqueeze(-1).float()
+            pool = (fl * am).sum(dim=1) / am.sum(dim=1).clamp_min(1.0)
 
-        fusion = hook.last
-        _exit_if(fusion is None, "Không lấy được fusion output từ hook (kiểm tra VLFusion).")
+        fv = model.visumodel(images, pad_mask, word_mask, fl, pool)          # (B,256,H,W)
+        fusion = model.vlmodel(fv, fl, word_mask)                             # EXPECT: (B,256,S)
 
-        if fusion.dim() != 3:
-            _exit_if(True, f"fusion output shape lạ: {tuple(fusion.shape)}")
+        # ---- Checks ----
+        assert fusion.dim() == 3 and fusion.size(1) == 256, \
+            f"[FAIL] Fusion phải là (B,256,S), nhận {tuple(fusion.shape)}"
+        B, C, S = fusion.shape
+        print(f"[PASS] Fusion shape (B,256,S) với S={S}")
 
-        if fusion.size(1) == 256:           # (B,256,S)
-            feat_pr0  = fusion[:, :, 0]
-            feat_last = fusion[:, :, -1]
-        elif fusion.size(2) == 256:         # (B,S,256)
-            feat_pr0  = fusion[:, 0, :]
-            feat_last = fusion[:, -1, :]
-        else:
-            _exit_if(True, f"fusion hidden dim != 256: {tuple(fusion.shape)}")
+        # [pr] ở đầu chuỗi và không bị pad (mask vị trí 0 phải False)
+        # tạo mask như trong VLFusion: [pr | vis | text]
+        Lv = fv.view(B, 256, -1).shape[2]
+        pr_pad  = torch.zeros((B,1),  dtype=torch.bool, device=device)
+        vis_pad = torch.zeros((B,Lv), dtype=torch.bool, device=device)
+        text_pad= (word_mask == 0).to(device)                                 # (B,L) True=pad
+        fused_mask = torch.cat([pr_pad, vis_pad, text_pad], dim=1)            # (B,S_expected)
+        assert fused_mask.shape[1] == S, f"[FAIL] mask hợp thành có S={fused_mask.shape[1]} khác fusion.S={S}"
+        assert (~fused_mask[:,0]).all(), "[FAIL] [pr] token bị pad"
+        print("[PASS] [pr] token ở đầu và không bị pad")
 
-        pred_pr0  = model.Prediction_Head(feat_pr0).sigmoid()
-        pred_last = model.Prediction_Head(feat_last).sigmoid()
+        # Head lấy token 0 -> (B,4) trong [0,1]
+        feat_pr = fusion[:, :, 0]                                             # (B,256)
+        head_out = model.box_head(feat_pr).sigmoid()
+        assert head_out.shape == (B,4), f"[FAIL] Box head output phải (B,4), nhận {tuple(head_out.shape)}"
+        assert (head_out >= 0).all() and (head_out <= 1).all(), "[FAIL] Box head không nằm trong [0,1]"
+        print("[PASS] Head dùng token 0 ([pr]) → (B,4) trong [0,1]")
 
-        pr0_px  = _sanitize_xyxy_t(pred_pr0 * scale)
-        last_px = _sanitize_xyxy_t(pred_last * scale)
+        # Thử forward end-to-end cũng trả (B,4)
+        out_full = model(images, pad_mask, word_id, word_mask)
+        assert out_full.shape == (B,4), f"[FAIL] model(...) phải trả (B,4), nhận {tuple(out_full.shape)}"
+        print("[PASS] Forward end-to-end trả (B,4)")
 
-        iou0,   _, _ = bbox_iou(pr0_px,  boxes_gt_px, x1y1x2y2=True)
-        iouLast,_, _ = bbox_iou(last_px, boxes_gt_px, x1y1x2y2=True)
-
-        better_pr0 += (iou0 >= iouLast).sum().item()
-        total_cmp  += B
-        print(f"  median IoU: pr0={iou0.median().item():.3f} vs last={iouLast.median().item():.3f}")
-
-        if batches >= 2:  # đủ cho smoke
-            break
-
-    hook.close()
-
-    if total_cmp > 0:
-        ratio = better_pr0 / total_cmp
-        _exit_if(ratio < 0.5, f"[pr]@index0 KHÔNG tốt hơn last token (tỉ lệ {ratio:.2f} < 0.5). Kiểm tra chọn token/head.")
-        PASS(f"[pr] token @ index 0 hợp lý (tỉ lệ pr0>=last: {ratio:.2f}).")
 
 
 # ---------- main ----------

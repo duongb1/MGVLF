@@ -69,7 +69,7 @@ class MGVLF(nn.Module):
     """
     Text encoder (BERT: word-level + 1 sentence) →
     CNN_MGVLF (DE refine fv1 bằng multi-scale vis + text) →
-    VLFusion (encoder với word tokens + [pr]) →
+    VLFusion (encoder với [pr] + vis + text) →
     Box head (cx,cy,w,h) ∈ [0,1]
     """
     def __init__(self, bert_model: str = 'bert-base-uncased', tunebert: bool = True, args: Optional[object] = None):
@@ -132,8 +132,7 @@ class MGVLF(nn.Module):
         Copy ResNet backbone từ ckpt DETR sang backbone hiện tại.
         Map từ 'backbone.0.body.*' (hoặc 'backbone.body.*') -> self.visumodel.backbone[0].body.*
         """
-        # Joiner(backbone, pos) => [0] là BackboneBase; .body là IntermediateLayerGetter
-        tgt = self.visumodel.backbone[0].body
+        tgt = self.visumodel.backbone[0].body  # Joiner[0] = BackboneBase; .body = IntermediateLayerGetter
         tgt_sd = tgt.state_dict()
 
         prefixes = ["backbone.0.body.", "backbone.body."]
@@ -260,9 +259,8 @@ class MGVLF(nn.Module):
         else:
             word_mask = word_mask.to(image.device).long()
 
-        # HF expects 1=real, 0=pad; key_padding_mask needs True=pad (nếu cần)
-        attn_mask = word_mask                       # (B,L) with 1=real cho BERT
-        # key_pad   = (word_mask == 0).bool()       # (B,L) True=pad (KHÔNG cần pass xuống vì các module tự xử lý)
+        # HF expects 1=real, 0=pad; key_padding_mask needs True=pad (để module con tự xử)
+        attn_mask = word_mask  # (B,L) với 1=real cho BERT
 
         # 1) text encoder
         outputs = self.textmodel(
@@ -270,7 +268,7 @@ class MGVLF(nn.Module):
             attention_mask=attn_mask,
             return_dict=True
         )
-        fl = outputs.last_hidden_state
+        fl = outputs.last_hidden_state                     # (B,L,768)
         sentence_feature = getattr(outputs, "pooler_output", None)
         if sentence_feature is None:
             am = attn_mask.unsqueeze(-1).float()
@@ -279,24 +277,28 @@ class MGVLF(nn.Module):
         if not self.tunebert:
             fl = fl.detach(); sentence_feature = sentence_feature.detach()
 
-        # 2) visual encoder  —— PASS HF mask (1=real, 0=pad) để module tự đảo
+        # 2) visual encoder —— PASS HF mask (1=real, 0=pad); module tự chuyển True=pad
         fv = self.visumodel(image, mask, word_mask, fl, sentence_feature)
 
-        # 3) fusion  —— PASS HF mask (1=real, 0=pad) để module tự đảo
+        # 3) fusion —— PASS HF mask (1=real, 0=pad); VLFusion dùng [pr|vis|text] với [pr] ở đầu
         x = self.vlmodel(fv, fl, word_mask)
 
-        # 4) feature cho head - lấy [pr] token ở index 0
-        if x.dim() == 2 and x.size(1) == 256:
+        # 4) feature cho head - LẤY [pr] token (index 0)
+        assert x.dim() in (2, 3), f"Unexpected fusion output dim: {x.shape}"
+        if x.dim() == 2:
+            # (B,256): coi như đã là [pr]
+            assert x.size(1) == 256, f"Flat fusion feature must be (B,256), got {x.shape}"
             feat = x
-        elif x.dim() == 3:
+        else:
+            # 3D: chấp nhận (B,256,S) hoặc (B,S,256)
             if x.size(1) == 256:
-                feat = x[:, :, 0]   # (B,256,S) -> token 0
+                # (B,256,S) -> lấy token 0 theo S (đã đảm bảo [pr] đứng đầu)
+                feat = x[:, :, 0]
             elif x.size(2) == 256:
-                feat = x[:, 0, :]   # (B,S,256) -> token 0
+                # (B,S,256) -> lấy token 0 theo S
+                feat = x[:, 0, :]
             else:
                 raise RuntimeError(f"Unexpected fusion output shape {x.shape}")
-        else:
-            raise RuntimeError(f"Unsupported fusion output shape {x.shape}")
 
         # 5) box head
         outbox = self.box_head(feat).sigmoid()

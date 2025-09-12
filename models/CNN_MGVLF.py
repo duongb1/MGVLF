@@ -92,13 +92,14 @@ class CNN_MGVLF(nn.Module):
         x = nextFeatureMap
         m = beforeMask
         assert m is not None
-        mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+        # dùng nearest để giữ nhị phân
+        mask = F.interpolate(m[None].float(), size=x.shape[-2:], mode="nearest").to(torch.bool)[0]
         return mask
 
     def forward(self, img, mask, word_mask, wordFeature, sentenceFeature):
         """
         img: (B,3,H,W), mask: (B,H,W) True=pad
-        word_mask: (B,L) with 1=real, 0=pad (HF convention) -> we will convert to True=pad below
+        word_mask: (B,L) with 1=real, 0=pad (HF convention) -> convert to True=pad where needed
         wordFeature: (B,L,768), sentenceFeature: (B,768)
         """
         samples = NestedTensor(img, mask)
@@ -147,24 +148,21 @@ class CNN_MGVLF(nn.Module):
         fl = fl.permute(1, 0, 2)                                                     # (L+1,B,256)
 
         # build masks
-        # HF: 1=real,0=pad  -> True=pad
-        word_pad = (~word_mask.bool())  # (B,L) -> this is WRONG; fix below
-        # Correct conversion:
-        # word_mask: 1=real, 0=pad
-        word_pad = (word_mask == 0)                     # (B,L) True=pad
+        # HF: 1=real, 0=pad  -> True=pad
+        word_pad = (word_mask == 0)                              # (B,L) True=pad
         sentence_pad = torch.zeros((bs, 1), dtype=torch.bool, device=word_mask.device)
-        text_pad = torch.cat([word_pad, sentence_pad], dim=1)                         # (B,L+1)
+        text_pad = torch.cat([word_pad, sentence_pad], dim=1)    # (B,L+1)
 
         vis_pad = torch.cat([
             mask4.view(bs, -1),
             fv2_mask.view(bs, -1),
             fv3_mask.view(bs, -1),
             fv4_mask.view(bs, -1),
-        ], dim=1).to(torch.bool)                                                      # (B,Lv)
+        ], dim=1).to(torch.bool)                                 # (B,Lv)
 
         # pos for text (use embedding slice up to Nt+1)
         Nt = wordFeature.size(1)   # number of word tokens before adding sentence token
-        flpos = self.text_pos_embed.weight[:Nt+1].unsqueeze(1).repeat(1, bs, 1)       # (Nt+1,B,256)
+        flpos = self.text_pos_embed.weight[:Nt+1].unsqueeze(1).repeat(1, bs, 1)  # (Nt+1,B,256)
 
         # concat pos and tokens for DE stage
         fvl = torch.cat((fv, fl), dim=0)                 # (Lv+L+1, B, 256)
@@ -173,10 +171,10 @@ class CNN_MGVLF(nn.Module):
 
         # run DE
         out_layers = self.DE(
-            fv1.permute(2, 0, 1),  # (Lv1, B, 256) as query if your DE expects it
-            fvl,                   # memory
-            fvl_mask,              # key_padding_mask (True=pad)
-            fvlpos,                # memory pos
+            fv1.permute(2, 0, 1),    # (Lv1, B, 256) as query (nếu DE của bạn mong đợi theo design cũ)
+            fvl,                     # memory
+            fvl_mask,                # key_padding_mask (True=pad)
+            fvlpos,                  # memory pos
             fvpos1.permute(2, 0, 1)  # query pos (for fv1)
         )
         fv1_encode = out_layers[-1].permute(1, 2, 0)     # (B,256,H1*W1)
@@ -206,10 +204,10 @@ class VLFusion(nn.Module):
 
     def forward(self, fv, fl, word_mask=None):
         """
-        fv: (B,256,H,W)
-        fl: (B,L,768) word-level (no sentence here if you choose); keep consistent across pipeline
-        word_mask: (B,L) 1=real,0=pad (HF)  -> we convert to True=pad here
-        returns last layer output (B,256,S)
+        fv: (B,256,H, W)
+        fl: (B,L,768) word-level from BERT (no sentence token here)
+        word_mask: (B,L) 1=real,0=pad (HF)  -> convert to True=pad here
+        returns last layer output (B,256,S) with token 0 = [pr]
         """
         B, C, H, W = fv.shape
         _, L, _    = fl.shape
