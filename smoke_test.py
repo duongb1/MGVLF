@@ -321,11 +321,20 @@ def check_model_and_fusion(args):
     a.dim_feedforward = 2048
     a.enc_layers = 6
     a.dec_layers = 1   # DE 1 layer
+    a.pre_norm = False          # <— THÊM DÒNG NÀY
     a.lr_backbone = 1e-4  # để freeze conv1/bn1/layer1, train layer2-4
     a.img_pe_type = "sine"
     a.max_query_len = 40
     a.max_fusion_len = 8192
     a.pretrain = ""    # không nạp ckpt tùy chọn
+
+    # fallback cho các attr có thể thiếu
+    for k, v in {
+        "activation": "relu",
+        "return_intermediate_dec": False,
+    }.items():
+        if not hasattr(a, k):
+            setattr(a, k, v)
 
     model = MGVLF(bert_model="bert-base-uncased", tunebert=True, args=a).to(device)
     model.eval()
