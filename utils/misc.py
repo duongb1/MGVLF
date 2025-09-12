@@ -221,25 +221,44 @@ def get_sha():
 
 def collate_fn(batch):
     """
-    Collate phù hợp với Dataset đang trả:
-      (img_t, pad_mask_np, word_id_np, word_mask_np, box_np)
-
-    Trả về:
-      images:   (B,3,H,W) float
-      pad_mask: (B,H,W)   bool  (True=pad)
-      word_id:  (B,L)     long
-      word_mask:(B,L)     long  (HF: 1=real, 0=pad)
-      boxes:    (B,4)     float (xyxy, cùng hệ với ảnh sau letterbox)
-    Nếu bạn đã convert sang torch.* ngay trong __getitem__, có thể bỏ collate_fn này.
+    Ghép batch cho RSVGDataset:
+      - img:   np.ndarray(H,W,3) uint8 hoặc torch.Tensor(C,H,W)  -> torch.FloatTensor(B,3,H,W) [0,1]
+      - mask:  np.ndarray(H,W) bool/uint8 -> torch.BoolTensor(B,H,W) (True=pad)
+      - ids:   np.ndarray(L,) int -> torch.LongTensor(B,L)
+      - amask: np.ndarray(L,) int -> torch.LongTensor(B,L)  (HF: 1=real, 0=pad)
+      - box:   np.ndarray(4,) float -> torch.FloatTensor(B,4)
     """
+    import torch
     import numpy as np
-    imgs, padms, wids, wmsk, boxes = zip(*batch)
 
-    images = torch.stack(imgs, 0)                              # (B,3,H,W)
-    pad_mask = torch.from_numpy(np.stack(padms, 0)).bool()     # (B,H,W)
-    word_id = torch.from_numpy(np.stack(wids, 0)).long()       # (B,L)
-    word_mask = torch.from_numpy(np.stack(wmsk, 0)).long()     # (B,L)
-    boxes = torch.from_numpy(np.stack(boxes, 0)).float()       # (B,4)
+    imgs, pad_masks, word_ids, word_masks, boxes = zip(*batch)
+
+    def _to_tensor_imagenet(x):
+        if isinstance(x, torch.Tensor):
+            return x
+        x = torch.from_numpy(x)                # HWC or HW
+        if x.ndim == 3:                        # HWC -> CHW
+            x = x.permute(2, 0, 1).contiguous()
+        x = x.float()
+        if x.max() > 1.5:                      # uint8 range -> [0,1]
+            x = x / 255.0
+        return x
+
+    # images -> (B,3,H,W)
+    imgs = [_to_tensor_imagenet(im) for im in imgs]
+    images = torch.stack(imgs, 0)
+
+    # pad_mask -> (B,H,W) bool
+    pad_masks = [torch.as_tensor(pm, dtype=torch.bool) for pm in pad_masks]
+    pad_mask = torch.stack(pad_masks, 0)
+
+    # word ids / masks -> (B,L) long
+    word_id   = torch.as_tensor(np.stack(word_ids,   axis=0), dtype=torch.long)
+    word_mask = torch.as_tensor(np.stack(word_masks, axis=0), dtype=torch.long)
+
+    # boxes -> (B,4) float32
+    boxes = torch.as_tensor(np.stack(boxes, axis=0), dtype=torch.float32)
+
     return images, pad_mask, word_id, word_mask, boxes
 
 
