@@ -6,6 +6,75 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 
 
+# ===================== FUSION ENCODER (1D, KHÔNG POOL) =====================
+
+class SeqEncoder1D(nn.Module):
+    """
+    Transformer encoder 1D cho chuỗi fusion [pr | vis | text].
+    - Input:
+        src  : (B, 256, S)
+        mask : (B, S) với True = pad
+        pos  : (B, S, 256) (tuỳ chọn)
+    - Output:
+        List[Tensor] với mỗi phần tử shape (B, 256, S), 1 phần tử / layer.
+      (Không pool theo S; giữ nguyên trục S như paper MGVLF.)
+    """
+    def __init__(
+        self,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 6,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        pre_norm: bool = False,
+        activation: str = "relu",
+    ):
+        super().__init__()
+        self.d_model = d_model
+
+        # Pytorch's TransformerEncoder expects (S, B, E) nếu batch_first=False
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=activation,
+            batch_first=False,          # dùng (S,B,E) để tránh nhầm lẫn
+            norm_first=pre_norm,
+        )
+        self.layers = nn.ModuleList([layer for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(d_model) if pre_norm is False else nn.Identity()
+
+    def forward(
+        self,
+        src: torch.Tensor,                  # (B, 256, S)
+        key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) True=pad
+        pos: Optional[torch.Tensor] = None  # (B, S, 256)
+    ) -> List[torch.Tensor]:
+        assert src.dim() == 3 and src.size(1) == self.d_model, \
+            f"Expect src (B,{self.d_model},S), got {tuple(src.shape)}"
+        B, C, S = src.shape
+
+        # (B,256,S) -> (S,B,256)
+        x = src.permute(2, 0, 1).contiguous()
+
+        # pos -> (S,B,256) nếu có
+        if pos is not None:
+            assert pos.shape == (B, S, C), f"pos must be (B,S,{C}), got {tuple(pos.shape)}"
+            pos_sb = pos.permute(1, 0, 2).contiguous()
+            x = x + pos_sb
+
+        outs = []
+        for lyr in self.layers:
+            x = lyr(x, src_key_padding_mask=key_padding_mask)   # (S,B,256)
+            outs.append(x.permute(1, 2, 0).contiguous())        # -> (B,256,S)
+
+        # hậu chuẩn hoá (nếu dùng post-norm)
+        if isinstance(self.norm, nn.LayerNorm):
+            outs = [self.norm(o.transpose(1, 2)).transpose(1, 2).contiguous() for o in outs]
+        return outs
+
+
 class Transformer_vis(nn.Module):
 
     def __init__(self, d_model=256, nhead=8, num_encoder_layers=6,dim_feedforward=2048,
@@ -337,18 +406,29 @@ def build_de(args):
     )
 
 
-def build_transformer(args):
-    return Transformer(
-        d_model=args.hidden_dim,
-        dropout=args.dropout,
-        nhead=args.nheads,
-        dim_feedforward=args.dim_feedforward,
-        num_encoder_layers=args.enc_layers,
-        num_decoder_layers=args.dec_layers,
-        normalize_before=args.pre_norm,
-        # TODO: return_intermediate_dec
-        return_intermediate_dec=True,
+def build_transformer(args) -> nn.Module:
+    """
+    Trả encoder cho NHÁNH FUSION (VLFusion). Không ảnh hưởng EN/DE visual.
+    Bảo đảm .d_model tồn tại (VLFusion dùng để khởi tạo pos_1d).
+    """
+    d_model          = getattr(args, "hidden_dim", 256)
+    nheads           = getattr(args, "nheads", 8)
+    enc_layers       = getattr(args, "enc_layers", 6)
+    dim_feedforward  = getattr(args, "dim_feedforward", 2048)
+    dropout          = getattr(args, "dropout", 0.1)
+    pre_norm         = getattr(args, "pre_norm", False)
+    activation       = getattr(args, "activation", "relu")
+
+    model = SeqEncoder1D(
+        d_model=d_model,
+        nhead=nheads,
+        num_layers=enc_layers,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        pre_norm=pre_norm,
+        activation=activation,
     )
+    return model
 
 def _get_activation_fn(activation):
     """Return an activation function given a string"""
