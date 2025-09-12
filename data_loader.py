@@ -68,37 +68,44 @@ class RSVGDataset(data.Dataset):
     def __getitem__(self, idx):
         img, phrase, bbox = self.pull_item(idx)
         phrase = phrase.lower()
-        h, w = img.shape[:2]
 
-        # NHẬN mask bool 2D từ letterbox
+        # letterbox trả ảnh size x size + mask pad (H,W)
         img, pad_mask, ratio, dw, dh = letterbox(img, None, self.imsize)
-        
-        # Fix ratio handling - check if ratio is tuple/list
+
+        # ratio có thể là scalar hoặc (rx,ry)
         if isinstance(ratio, (tuple, list, np.ndarray)):
             rx, ry = float(ratio[0]), float(ratio[1])
         else:
             rx = ry = float(ratio)
-        
-        # Scale bbox coordinates
+
+        # === scale bbox sang hệ ảnh đã letterbox (PIXEL XYXY) ===
+        bbox = bbox.astype(np.float32)
         bbox[0], bbox[2] = bbox[0] * rx + dw, bbox[2] * rx + dw
         bbox[1], bbox[3] = bbox[1] * ry + dh, bbox[3] * ry + dh
 
-        if self.transform is not None:
-            img = self.transform(img)  # ToTensor + Normalize
+        # === clamp về [0, imsize-1] để tránh tràn ===
+        np.clip(bbox, 0, self.imsize - 1, out=bbox)
 
+        # === mask dạng bool (H,W) ===
+        pad_mask = pad_mask.astype(bool)
+
+        # Transform ảnh (ToTensor + Normalize)
+        if self.transform is not None:
+            img = self.transform(img)
+
+        # Tokenize (HF: 1=real, 0=pad)
         enc = self.tokenizer(
             phrase, max_length=self.query_len, padding="max_length",
             truncation=True, return_tensors=None, add_special_tokens=True
         )
-        word_id = np.array(enc["input_ids"], dtype=int)
-        word_mask = np.array(enc["attention_mask"], dtype=int)
+        word_id = np.array(enc["input_ids"], dtype=np.int64)
+        word_mask = np.array(enc["attention_mask"], dtype=np.int64)
 
         if self.testmode:
             return (img, pad_mask, word_id, word_mask,
-                    np.array(bbox, np.float32),
-                    np.array(ratio, np.float32),
-                    np.array(dw, np.float32),
-                    np.array(dh, np.float32),
+                    bbox.astype(np.float32),           # xyxy PIXEL sau letterbox
+                    np.array([rx, ry], np.float32),    # ratio chuẩn hoá về 2 phần tử
+                    np.float32(dw), np.float32(dh),
                     self.images[idx][0], phrase)
         else:
-            return img, pad_mask, word_id, word_mask, np.array(bbox, np.float32)
+            return img, pad_mask, word_id, word_mask, bbox.astype(np.float32)

@@ -22,7 +22,21 @@ from utils.utils import AverageMeter, xyxy2xywh, bbox_iou, adjust_learning_rate
 from utils.checkpoint import save_checkpoint, load_pretrain, load_resume
 
 # ===== AMP: import autocast + GradScaler =====
-from torch.amp import autocast, GradScaler
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
+
+# --- box helpers (không tạo file mới) ---
+def cxcywh_to_xyxy(box):
+    cxcy, wh = box[:, :2], box[:, 2:]
+    xy1 = cxcy - wh / 2
+    xy2 = cxcy + wh / 2
+    return torch.cat([xy1, xy2], dim=1)
+
+def clamp01(x):
+    return x.clamp(0, 1)
+
+def pix_to_norm_xyxy(xyxy_pix, size):
+    return xyxy_pix / float(size - 1)
 
 
 
@@ -200,27 +214,18 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
 
         # ====== AMP: forward dưới autocast (model fp16/bf16), loss ở fp32 ======
         with autocast(device_type="cuda", dtype=torch.float16):
-            pred_bbox = model(imgs, masks, word_id, word_mask)
+            pred_bbox = model(imgs, masks, word_id, word_mask)   # pred_cxcywh_norm ∈ [0,1]
 
-        with autocast(device_type="cuda", enabled=False):
-            pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
-            gt_bbox_f   = gt_bbox.float()       # xyxy in pixel
+        with autocast(device_type="cuda", enabled=False):     # hoặc with torch.amp.autocast('cuda', enabled=False)
+            pred_bbox_f = pred_bbox.float()          # cxcywh_norm
+            gt_bbox_f   = gt_bbox.float()            # xyxy_pixels
 
-            # === đổi sang xyxy (pixel) ở ngoài
-            pred_xyxy = torch.cat(
-                [pred_bbox_f[:, :2] - pred_bbox_f[:, 2:] / 2,
-                 pred_bbox_f[:, :2] + pred_bbox_f[:, 2:] / 2],
-                dim=1
-            ) * (args.size - 1)
-            pred_xyxy = pred_xyxy.clamp(min=0, max=args.size - 1)
+            # --- convert cho LOSS: norm xyxy ---
+            pred_xyxy_norm = clamp01(cxcywh_to_xyxy(pred_bbox_f))          # ∈ [0,1]
+            gt_xyxy_norm   = clamp01(pix_to_norm_xyxy(gt_bbox_f, args.size))
 
-            # GIoU trên xyxy (pixel)
-            giou = GIoU_Loss(pred_xyxy, gt_bbox_f)
-
-            # L1 trên cxcywh (norm)
-            gt_bbox_xywh = xyxy2xywh(gt_bbox_f)
-            l1 = Reg_Loss(pred_bbox_f, gt_bbox_xywh / (args.size - 1))
-
+            giou = GIoU_Loss(pred_xyxy_norm, gt_xyxy_norm)                 # loss ăn norm
+            l1   = Reg_Loss(pred_xyxy_norm, gt_xyxy_norm)
             loss = giou + l1
 
         optimizer.zero_grad(set_to_none=True)
@@ -232,9 +237,9 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scaler):
         l1_losses.update(l1.item(), imgs.size(0))
         GIoU_losses.update(giou.item(), imgs.size(0))
 
-        # metrics (dùng lại pred_xyxy đã tính ở trên)
-        pred_xyxy = pred_xyxy
-        iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
+        # === METRIC: dùng pixel xyxy ===
+        pred_xyxy_pixels = (pred_xyxy_norm * (args.size - 1)).clamp(0, args.size - 1)
+        iou, interArea, unionArea = bbox_iou(pred_xyxy_pixels.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
         cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
         cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))
         accu5 = np.mean((iou.data.cpu().numpy() > 0.5).astype(float))
@@ -293,31 +298,21 @@ def validate_epoch(val_loader, model, args):
             pred_bbox = model(imgs, masks, word_id, word_mask)
 
         with autocast(device_type="cuda", enabled=False):
-            pred_bbox_f = pred_bbox.float()     # (cx,cy,w,h) in [0,1]
-            gt_bbox_f   = gt_bbox.float()       # xyxy in pixel
+            pred_bbox_f = pred_bbox.float()
+            gt_bbox_f   = gt_bbox.float()
 
-            # === đổi sang xyxy (pixel) ở ngoài
-            pred_xyxy_for_loss = torch.cat(
-                [pred_bbox_f[:, :2] - pred_bbox_f[:, 2:] / 2,
-                 pred_bbox_f[:, :2] + pred_bbox_f[:, 2:] / 2],
-                dim=1
-            ) * (args.size - 1)
-            pred_xyxy_for_loss = pred_xyxy_for_loss.clamp(min=0, max=args.size - 1)
+            pred_xyxy_norm = clamp01(cxcywh_to_xyxy(pred_bbox_f))
+            gt_xyxy_norm   = clamp01(pix_to_norm_xyxy(gt_bbox_f, args.size))
 
-            # GIoU trên xyxy (pixel)
-            giou = GIoU_Loss(pred_xyxy_for_loss, gt_bbox_f)
-
-            # L1 trên cxcywh (norm)
-            gt_bbox_xywh = xyxy2xywh(gt_bbox_f)
-            l1 = Reg_Loss(pred_bbox_f, gt_bbox_xywh / (args.size - 1))
-
+            giou = GIoU_Loss(pred_xyxy_norm, gt_xyxy_norm)
+            l1   = Reg_Loss(pred_xyxy_norm, gt_xyxy_norm)
             loss = giou + l1
 
             losses.update(loss.item(), imgs.size(0)); l1_losses.update(l1.item(), imgs.size(0)); GIoU_losses.update(giou.item(), imgs.size(0))
 
-            # metrics (dùng lại pred_xyxy đã tính ở trên)
-            pred_xyxy = pred_xyxy_for_loss
-            iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
+            # metrics (pixel)
+            pred_xyxy_pixels = (pred_xyxy_norm * (args.size - 1)).clamp(0, args.size - 1)
+            iou, interArea, unionArea = bbox_iou(pred_xyxy_pixels.data.cpu(), gt_bbox_f.data.cpu(), x1y1x2y2=True)
             cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
             cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))
             accu5 = np.mean((iou.data.cpu().numpy() > 0.5).astype(float))
