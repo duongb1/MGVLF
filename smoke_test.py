@@ -16,6 +16,8 @@ python smoke_test.py \
 """
 
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # tránh cảnh báo fork của HF tokenizers
+
 import sys
 import math
 import argparse
@@ -55,7 +57,6 @@ def _split_ratio(r):
       - numpy.ndarray: 0-d (scalar) hoặc có >=2 phần tử
     """
     import numpy as _np
-    # tuple/list
     if isinstance(r, (tuple, list)):
         if len(r) >= 2:
             return float(r[0]), float(r[1])
@@ -63,11 +64,9 @@ def _split_ratio(r):
             v = float(r[0]); return v, v
         else:
             return 1.0, 1.0
-    # numpy array
     if isinstance(r, _np.ndarray):
-        if r.ndim == 0:                  # scalar array
-            v = float(r)
-            return v, v
+        if r.ndim == 0:
+            v = float(r); return v, v
         r = r.reshape(-1)
         if r.size >= 2:
             return float(r[0]), float(r[1])
@@ -75,9 +74,18 @@ def _split_ratio(r):
             v = float(r[0]); return v, v
         else:
             return 1.0, 1.0
-    # số thường
     v = float(r)
     return v, v
+
+def _to_tensor_imagenet(img_np: np.ndarray) -> torch.Tensor:
+    """
+    np.uint8 RGB (H,W,3) -> torch.float32 (3,H,W), normalized ImageNet.
+    """
+    t = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()  # (3,H,W), uint8
+    t = t.float().div_(255.0)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return (t - mean) / std
 
 
 @torch.no_grad()
@@ -94,23 +102,17 @@ def sanity_iou_one():
 def build_args_shim(device: str):
     class A: pass
     a = A()
-    # backbone / PE
     a.backbone = 'resnet50'
     a.img_pe_type = 'sine'
     a.dilation = False
     a.masks = True           # cần intermediate layers
-    # dims
     a.hidden_dim = 256
-    # train flags (không train ở đây, nhưng backbone set freeze dựa vào lr_backbone)
     a.lr = 1e-4
     a.lr_backbone = 1e-5
     a.lr_drop = 60
     a.lr_dec = 0.1
-    # fusion PE 1D
     a.fusion_pe_max_len = 4096
-    # device
     a.device = device
-    # pretrain (seed_from_detr trong model.py sẽ tự xử lý nếu có)
     a.pretrain = ""
     return a
 
@@ -123,9 +125,9 @@ class HookFusionOut:
 
     def _hook(self, module, inp, out):
         try:
-            self.last = out[-1].detach()  # list of layers -> lấy cuối
+            self.last = out[-1].detach()
         except Exception:
-            self.last = out.detach()      # một số impl trả trực tiếp tensor
+            self.last = out.detach()
 
     def close(self):
         if self.h: self.h.remove()
@@ -157,7 +159,6 @@ def check_dataset_unit(args):
         rx, ry = _split_ratio(ratio)
         dw = float(dw); dh = float(dh)
 
-        # nghịch đảo rồi forward lại
         inv = np.array([(bx[0]-dw)/rx, (bx[1]-dh)/ry, (bx[2]-dw)/rx, (bx[3]-dh)/ry], dtype=np.float32)
         fwd = np.array([inv[0]*rx+dw, inv[1]*ry+dh, inv[2]*rx+dw, inv[3]*ry+dh], dtype=np.float32)
         ok_ratio &= np.allclose(fwd, bx, atol=1e-3)
@@ -175,13 +176,13 @@ def check_dataset_unit(args):
 def check_collate(args):
     ds = RSVGDataset(
         images_path=args.images_path, anno_path=args.anno_path,
-        imsize=args.imsize, transform=None, augment=False,
-        split=args.split, testmode=False, max_query_len=40,
+        imsize=args.imsize, transform=_to_tensor_imagenet,  # <--- CHUYỂN ẢNH SANG TENSOR
+        augment=False, split=args.split, testmode=False, max_query_len=40,
         splits_dir=args.splits_dir
     )
     subset = Subset(ds, list(range(min(args.limit or 16, len(ds)))))
     loader = DataLoader(subset, batch_size=4, shuffle=False,
-                        num_workers=2, pin_memory=True, collate_fn=collate_fn)
+                        num_workers=0, pin_memory=True, collate_fn=collate_fn)  # num_workers=0 để tránh fork warning
     images, pad_mask, word_id, word_mask, boxes = next(iter(loader))
 
     B, C, H, W = images.shape
@@ -196,13 +197,13 @@ def check_collate(args):
 def check_backbone(args):
     ds = RSVGDataset(
         images_path=args.images_path, anno_path=args.anno_path,
-        imsize=args.imsize, transform=None, augment=False,
-        split=args.split, testmode=False, max_query_len=40,
+        imsize=args.imsize, transform=_to_tensor_imagenet,  # <--- CHUYỂN ẢNH SANG TENSOR
+        augment=False, split=args.split, testmode=False, max_query_len=40,
         splits_dir=args.splits_dir
     )
     subset = Subset(ds, list(range(min(args.limit or 8, len(ds)))))
     loader = DataLoader(subset, batch_size=min(4, len(subset)), shuffle=False,
-                        num_workers=2, pin_memory=True, collate_fn=collate_fn)
+                        num_workers=0, pin_memory=True, collate_fn=collate_fn)
 
     images, pad_mask, *_ = next(iter(loader))
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -233,7 +234,6 @@ def check_backbone(args):
     _exit_if(mx > 1.0 or mn < 0.0, "Mask sau nội suy không còn nhị phân?")
     PASS("Mask sau nội suy vẫn nhị phân (nearest).")
 
-    # Freeze/training flags sanity (tùy cấu hình lr_backbone)
     trainable = [(n, p.requires_grad) for n, p in backbone[0].body.named_parameters()]
     any_l2l4_true = any((("layer2" in n) or ("layer3" in n) or ("layer4" in n)) and rg for n, rg in trainable)
     any_c1l1_true = any((("conv1" in n) or ("bn1" in n) or ("layer1" in n)) and rg for n, rg in trainable)
@@ -247,13 +247,13 @@ def check_model_and_fusion(args):
     """Chạy 1-2 batch qua MGVLF: kiểm polarity token pad + so sánh head([pr]=0) vs head(last)."""
     ds = RSVGDataset(
         images_path=args.images_path, anno_path=args.anno_path,
-        imsize=args.imsize, transform=None, augment=False,
-        split=args.split, testmode=False, max_query_len=40,
+        imsize=args.imsize, transform=_to_tensor_imagenet,  # <--- CHUYỂN ẢNH SANG TENSOR
+        augment=False, split=args.split, testmode=False, max_query_len=40,
         splits_dir=args.splits_dir
     )
     subset = Subset(ds, list(range(min(args.limit or 16, len(ds)))))
     loader = DataLoader(subset, batch_size=min(8, len(subset)), shuffle=False,
-                        num_workers=2, pin_memory=True, collate_fn=collate_fn)
+                        num_workers=0, pin_memory=True, collate_fn=collate_fn)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     model = MGVLF(bert_model="bert-base-uncased", tunebert=True, args=build_args_shim(device.type))
@@ -273,22 +273,18 @@ def check_model_and_fusion(args):
         word_mask = word_mask.to(device).long()
         boxes_gt_px = boxes_gt_px.to(device).float()
 
-        # Hints về polarity: HF 0=pad → key_pad=(word_mask==0)
         pad_tokens = (word_mask == 0).sum().item()
         print(f"[Batch {batches}] pad_tokens={pad_tokens}/{word_mask.numel()}")
 
-        # Forward model
         preds_norm = model(images, pad_mask, word_id, word_mask)  # (B,4) in [0,1], xyxy
         B, _, H, W = images.shape
         scale = torch.tensor([W, H, W, H], device=device, dtype=preds_norm.dtype)
         preds_px = _sanitize_xyxy_t(preds_norm * scale)
         boxes_gt_px = _sanitize_xyxy_t(boxes_gt_px)
 
-        # Lấy fusion output qua hook
         fusion = hook.last
         _exit_if(fusion is None, "Không lấy được fusion output từ hook (kiểm tra VLFusion).")
 
-        # Chọn token 0 vs -1
         if fusion.dim() != 3:
             _exit_if(True, f"fusion output shape lạ: {tuple(fusion.shape)}")
 
@@ -301,7 +297,6 @@ def check_model_and_fusion(args):
         else:
             _exit_if(True, f"fusion hidden dim != 256: {tuple(fusion.shape)}")
 
-        # Cùng head của model để so sánh
         pred_pr0  = model.Prediction_Head(feat_pr0).sigmoid()
         pred_last = model.Prediction_Head(feat_last).sigmoid()
 
@@ -338,15 +333,11 @@ def main():
     parser.add_argument("--device",      type=str, default="cuda")
     args = parser.parse_args()
 
-    # 1) Sanity IoU
     sanity_iou_one()
-    # 2) Data pipeline
-    check_dataset_unit(args)
-    check_collate(args)
-    # 3) Backbone
-    check_backbone(args)
-    # 4) Model + Fusion [pr]
-    check_model_and_fusion(args)
+    check_dataset_unit(args)   # testmode=True, không cần transform
+    check_collate(args)        # dùng _to_tensor_imagenet
+    check_backbone(args)       # dùng _to_tensor_imagenet
+    check_model_and_fusion(args)  # dùng _to_tensor_imagenet
 
     print("\n✅ SMOKE TEST PASSED.\n")
 
