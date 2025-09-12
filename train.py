@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument('--workers', default=0, type=int)
     parser.add_argument('--nb_epoch', default=150, type=int)
     parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--lr_backbone', default=0.0, type=float, help='Learning rate for backbone (0 means freeze)')
     parser.add_argument('--lr_dec', default=0.1, type=float)
     parser.add_argument('--batch_size', default=10, type=int)
     parser.add_argument('--resume', default='', type=str, metavar='PATH')

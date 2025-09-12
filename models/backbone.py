@@ -52,10 +52,11 @@ class BackboneBase(nn.Module):
     def __init__(self, backbone: nn.Module, train_backbone: bool,
                  num_channels: int, return_interm_layers: bool):
         super().__init__()
-        # Freeze conv1+bn1+layer1 khi train_backbone=True; freeze toàn bộ khi False
+        # ---- FREEZE RULE: chỉ layer2/3/4 trainable khi train_backbone=True ----
+        trainable_layers = {'layer2', 'layer3', 'layer4'} if train_backbone else set()
         for name, parameter in backbone.named_parameters():
-            if (not train_backbone) or ('layer2' not in name and 'layer3' not in name and 'layer4' not in name):
-                parameter.requires_grad_(False)
+            allow_train = any(t in name for t in trainable_layers)
+            parameter.requires_grad_(bool(allow_train))
 
         if return_interm_layers:
             return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
@@ -126,9 +127,8 @@ def build_backbone(args):
         args, position_embedding=getattr(args, 'img_pe_type', 'sine')
     )
 
-    # Quyết định train backbone dựa trên lr_backbone nếu có; fallback lr tổng
-    lr_backbone = getattr(args, "lr_backbone", None)
-    train_backbone = (lr_backbone if lr_backbone is not None else getattr(args, "lr", 0.0)) > 0
+    # ---- dùng lr_backbone để quyết định có train backbone hay không ----
+    train_backbone = getattr(args, 'lr_backbone', 0.0) > 0.0
 
     # Trả trung gian nếu cần mask/DETR-like
     return_interm_layers = bool(getattr(args, "masks", False))
