@@ -93,16 +93,17 @@ def all_gather(data):
     tensor = torch.ByteTensor(storage).to(device)
 
     # obtain Tensor size of each rank
-    local_size = torch.tensor([tensor.numel()], device=device)
+    local_size_t = torch.tensor([tensor.numel()], device=device)
     size_list = [torch.tensor([0], device=device) for _ in range(world_size)]
-    dist.all_gather(size_list, local_size)
+    dist.all_gather(size_list, local_size_t)
     size_list = [int(size.item()) for size in size_list]
     max_size = max(size_list)
 
     # receiving Tensor from all ranks
     tensor_list = [torch.empty((max_size,), dtype=torch.uint8, device=device) for _ in size_list]
-    if local_size != max_size:
-        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device=device)
+    ls = int(local_size_t.item())
+    if ls != max_size:
+        padding = torch.empty(size=(max_size - ls,), dtype=torch.uint8, device=device)
         tensor = torch.cat((tensor, padding), dim=0)
     dist.all_gather(tensor_list, tensor)
 
@@ -219,10 +220,27 @@ def get_sha():
 
 
 def collate_fn(batch):
-    # Không dùng trong pipeline hiện tại, giữ nguyên để tương thích nếu cần.
-    batch = list(zip(*batch))
-    batch[0] = nested_tensor_from_tensor_list(batch[0])
-    return tuple(batch)
+    """
+    Collate phù hợp với Dataset đang trả:
+      (img_t, pad_mask_np, word_id_np, word_mask_np, box_np)
+
+    Trả về:
+      images:   (B,3,H,W) float
+      pad_mask: (B,H,W)   bool  (True=pad)
+      word_id:  (B,L)     long
+      word_mask:(B,L)     long  (HF: 1=real, 0=pad)
+      boxes:    (B,4)     float (xyxy, cùng hệ với ảnh sau letterbox)
+    Nếu bạn đã convert sang torch.* ngay trong __getitem__, có thể bỏ collate_fn này.
+    """
+    import numpy as np
+    imgs, padms, wids, wmsk, boxes = zip(*batch)
+
+    images = torch.stack(imgs, 0)                              # (B,3,H,W)
+    pad_mask = torch.from_numpy(np.stack(padms, 0)).bool()     # (B,H,W)
+    word_id = torch.from_numpy(np.stack(wids, 0)).long()       # (B,L)
+    word_mask = torch.from_numpy(np.stack(wmsk, 0)).long()     # (B,L)
+    boxes = torch.from_numpy(np.stack(boxes, 0)).float()       # (B,4)
+    return images, pad_mask, word_id, word_mask, boxes
 
 
 def _max_by_axis(the_list):
@@ -335,13 +353,17 @@ def save_on_master(*args, **kwargs):
 
 
 def init_distributed_mode(args):
+    # ensure default dist_url
+    if not hasattr(args, "dist_url"):
+        args.dist_url = "env://"
+
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
-        args.gpu = int(os.environ['LOCAL_RANK'])
+        args.gpu = int(os.environ.get('LOCAL_RANK', 0))
     elif 'SLURM_PROCID' in os.environ:
         args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
+        args.gpu = args.rank % max(torch.cuda.device_count(), 1)
     else:
         print('Not using distributed mode')
         args.distributed = False
@@ -383,10 +405,3 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     Keeps support for empty batch sizes implicitly handled by PyTorch.
     """
     return F.interpolate(input, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
-
-
-if __name__ == '__main__':
-    samples = torch.zeros((2, 3, 64, 64))
-    if isinstance(samples, (list, torch.Tensor)):
-        samples = nested_tensor_from_tensor_list([samples[0], samples[1]])
-    print('OK')

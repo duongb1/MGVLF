@@ -3,43 +3,25 @@
 Backbone modules.
 """
 from collections import OrderedDict
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
 import torchvision
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
-from typing import Dict, List
-
-# Dùng dynamic import để tránh lỗi type checking
-def get_resnet_weights():
-    try:
-        from torchvision.models import ResNet18_Weights, ResNet34_Weights, ResNet50_Weights, ResNet101_Weights
-        return {
-            'resnet18':  ResNet18_Weights.IMAGENET1K_V1,
-            'resnet34':  ResNet34_Weights.IMAGENET1K_V1,
-            'resnet50':  ResNet50_Weights.IMAGENET1K_V2,
-            'resnet101': ResNet101_Weights.IMAGENET1K_V2,
-        }
-    except ImportError:
-        return None
 
 from utils.misc import NestedTensor
-
 from .position_encoding import build_position_encoding
 
 
 class FrozenBatchNorm2d(torch.nn.Module):
     """
-    BatchNorm2d where the batch statistics and the affine parameters are fixed.
-
-    Copy-paste from torchvision.misc.ops with added eps before rqsrt,
-    without which any other models than torchvision.models.resnet[18,34,50,101]
-    produce nans.
+    BatchNorm2d “đóng băng”: thống kê & tham số affine cố định.
+    (Bản từ torchvision, thêm eps trước rsqrt để tránh NaN.)
     """
-
     def __init__(self, n):
-        super(FrozenBatchNorm2d, self).__init__()
+        super().__init__()
         self.register_buffer("weight", torch.ones(n))
         self.register_buffer("bias", torch.zeros(n))
         self.register_buffer("running_mean", torch.zeros(n))
@@ -50,14 +32,12 @@ class FrozenBatchNorm2d(torch.nn.Module):
         num_batches_tracked_key = prefix + 'num_batches_tracked'
         if num_batches_tracked_key in state_dict:
             del state_dict[num_batches_tracked_key]
-
-        super(FrozenBatchNorm2d, self)._load_from_state_dict(
+        super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs)
+            missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(self, x):
-        # move reshapes to the beginning
-        # to make it fuser-friendly
         w = self.weight.reshape(1, -1, 1, 1)
         b = self.bias.reshape(1, -1, 1, 1)
         rv = self.running_var.reshape(1, -1, 1, 1)
@@ -69,57 +49,57 @@ class FrozenBatchNorm2d(torch.nn.Module):
 
 
 class BackboneBase(nn.Module):
-
-    def __init__(self, backbone: nn.Module, train_backbone: bool, num_channels: int, return_interm_layers: bool):
+    def __init__(self, backbone: nn.Module, train_backbone: bool,
+                 num_channels: int, return_interm_layers: bool):
         super().__init__()
+        # Freeze conv1+bn1+layer1 khi train_backbone=True; freeze toàn bộ khi False
         for name, parameter in backbone.named_parameters():
-            if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
+            if (not train_backbone) or ('layer2' not in name and 'layer3' not in name and 'layer4' not in name):
                 parameter.requires_grad_(False)
+
         if return_interm_layers:
             return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
         else:
-            return_layers = {'layer4': "0"}
+            return_layers = {"layer4": "0"}
+
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
 
     def forward(self, tensor_list: NestedTensor):
-        xs = self.body(tensor_list.tensors)
+        xs = self.body(tensor_list.tensors)  # OrderedDict[str, Tensor]
         out: Dict[str, NestedTensor] = {}
+        m = tensor_list.mask
+        assert m is not None
         for name, x in xs.items():
-            m = tensor_list.mask
-            assert m is not None
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+            # mask: True=padding; nội suy nearest để giữ nhị phân
+            mask = F.interpolate(m[None].float(), size=x.shape[-2:], mode="nearest").to(torch.bool)[0]
             out[name] = NestedTensor(x, mask)
         return out
 
 
 class Backbone(BackboneBase):
-    """ResNet backbone with frozen BatchNorm."""
-    def __init__(self, name: str,
-                 train_backbone: bool,
-                 return_interm_layers: bool,
-                 dilation: bool):
+    """ResNet backbone with FrozenBatchNorm (không load ImageNet)."""
+    def __init__(self, name: str, train_backbone: bool,
+                 return_interm_layers: bool, dilation: bool):
         ctor = getattr(torchvision.models, name)
-        
-        # Thử dùng weights API mới trước, fallback sang pretrained=True
-        weights_map = get_resnet_weights()
-        
+
+        # KHÔNG load ImageNet pretrained -> weights=None / pretrained=False
         try:
-            if weights_map is not None:
-                backbone = ctor(
-                    weights=weights_map.get(name, None),
-                    replace_stride_with_dilation=[False, False, dilation],
-                    norm_layer=FrozenBatchNorm2d
-                )
-            else:
-                raise TypeError("Fallback to old API")
-        except (TypeError, AttributeError):
-            # Fallback cho torchvision cũ
+            # API mới (torchvision>=0.13): dùng tham số weights=None
+            backbone = ctor(
+                weights=None,
+                replace_stride_with_dilation=[False, False, dilation],
+                norm_layer=FrozenBatchNorm2d,
+            )
+        except TypeError:
+            # API cũ: dùng pretrained=False
             backbone = ctor(
                 replace_stride_with_dilation=[False, False, dilation],
-                pretrained=True, norm_layer=FrozenBatchNorm2d)
-        
-        num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
+                pretrained=False,
+                norm_layer=FrozenBatchNorm2d,
+            )
+
+        num_channels = 512 if name in ("resnet18", "resnet34") else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
 
@@ -128,25 +108,37 @@ class Joiner(nn.Sequential):
         super().__init__(backbone, position_embedding)
 
     def forward(self, tensor_list: NestedTensor):
-        xs = self[0](tensor_list)
+        xs = self[0](tensor_list)  # Dict[str, NestedTensor]
         out: List[NestedTensor] = []
         pos = []
-        for name, x in xs.items():
+        # Duyệt theo thứ tự key để ổn định (layer1->4)
+        for key in sorted(xs.keys(), key=lambda k: int(k)):
+            x = xs[key]
             out.append(x)
-            # position encoding
+            # position encoding ảnh (2D), dtype khớp feature map
             pos.append(self[1](x).to(x.tensors.dtype))
-
         return out, pos
 
 
 def build_backbone(args):
+    # PE cho ảnh (thường 'sine'); đừng nhầm với PE 1D của fusion
     position_embedding = build_position_encoding(
         args, position_embedding=getattr(args, 'img_pe_type', 'sine')
     )
-    train_backbone = args.lr > 0
-    return_interm_layers = args.masks
-    return_interm_layers = True
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+
+    # Quyết định train backbone dựa trên lr_backbone nếu có; fallback lr tổng
+    lr_backbone = getattr(args, "lr_backbone", None)
+    train_backbone = (lr_backbone if lr_backbone is not None else getattr(args, "lr", 0.0)) > 0
+
+    # Trả trung gian nếu cần mask/DETR-like
+    return_interm_layers = bool(getattr(args, "masks", False))
+
+    backbone = Backbone(
+        name=args.backbone,
+        train_backbone=train_backbone,
+        return_interm_layers=return_interm_layers,
+        dilation=bool(getattr(args, "dilation", False)),
+    )
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

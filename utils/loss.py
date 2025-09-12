@@ -1,40 +1,61 @@
-import numpy as np
+# utils/loss.py
 import torch
 import torch.nn.functional as F
 
-def Reg_Loss(output, target):
-    sm_l1_loss = torch.nn.SmoothL1Loss(reduction='mean')
-    
-    loss_x1 = sm_l1_loss(output[:,0], target[:,0])
-    loss_x2 = sm_l1_loss(output[:,1], target[:,1])
-    loss_y1 = sm_l1_loss(output[:,2], target[:,2])
-    loss_y2 = sm_l1_loss(output[:,3], target[:,3])
+_EPS = 1e-7
 
-    return (loss_x1+loss_x2+loss_y1+loss_y2)
-
-
-def GIoU_Loss(pred_xyxy, gt_xyxy):
+def _sanitize_xyxy(box: torch.Tensor):
     """
-    pred_xyxy, gt_xyxy: (B,4) ở pixel, dạng [x1,y1,x2,y2]
-    Trả về: mean(1 - GIoU)
+    box: (..., 4) in xyxy (normalized [0,1] or pixels, miễn cùng hệ)
+    đảm bảo x1<=x2, y1<=y2 và clamp vào [0,1] nếu có thể suy ra miền.
     """
-    # Intersection
-    max_xy = torch.min(pred_xyxy[:, 2:], gt_xyxy[:, 2:])
-    min_xy = torch.max(pred_xyxy[:, :2], gt_xyxy[:, :2])
-    inter = torch.clamp(max_xy - min_xy, min=0)
-    inter_area = inter[:, 0] * inter[:, 1]
+    x1 = torch.minimum(box[..., 0], box[..., 2])
+    y1 = torch.minimum(box[..., 1], box[..., 3])
+    x2 = torch.maximum(box[..., 0], box[..., 2])
+    y2 = torch.maximum(box[..., 1], box[..., 3])
+    out = torch.stack([x1, y1, x2, y2], dim=-1)
+    return out
 
-    # Union
-    area1 = (pred_xyxy[:, 2] - pred_xyxy[:, 0]) * (pred_xyxy[:, 3] - pred_xyxy[:, 1])
-    area2 = (gt_xyxy[:, 2] - gt_xyxy[:, 0]) * (gt_xyxy[:, 3] - gt_xyxy[:, 1])
-    union = area1 + area2 - inter_area + 1e-7
-    iou = inter_area / union
+def Reg_Loss(pred_xyxy: torch.Tensor, gt_xyxy: torch.Tensor, reduction: str = "mean"):
+    """
+    SmoothL1 trên xyxy. Cả pred và gt nên cùng hệ (khuyến nghị [0,1]).
+    """
+    pred = _sanitize_xyxy(pred_xyxy)
+    gt   = _sanitize_xyxy(gt_xyxy)
+    loss = F.smooth_l1_loss(pred, gt, reduction=reduction)
+    return loss
 
-    # Enclose
-    enclose_lt = torch.min(pred_xyxy[:, :2], gt_xyxy[:, :2])
-    enclose_rb = torch.max(pred_xyxy[:, 2:], gt_xyxy[:, 2:])
-    enclose_wh = torch.clamp(enclose_rb - enclose_lt, min=0)
-    enclose_area = enclose_wh[:, 0] * enclose_wh[:, 1] + 1e-7
+def GIoU_Loss(pred_xyxy: torch.Tensor, gt_xyxy: torch.Tensor, reduction: str = "mean"):
+    """
+    Generalized IoU loss: 1 - GIoU.
+    pred_xyxy, gt_xyxy: (B,4) cùng hệ toạ độ (khuyến nghị [0,1]).
+    """
+    p = _sanitize_xyxy(pred_xyxy)
+    g = _sanitize_xyxy(gt_xyxy)
 
-    giou = iou - (enclose_area - union) / enclose_area
-    return (1.0 - giou).mean()
+    # intersection
+    lt = torch.maximum(p[:, :2], g[:, :2])                 # (B,2)
+    rb = torch.minimum(p[:, 2:], g[:, 2:])                 # (B,2)
+    wh = (rb - lt).clamp(min=0)                            # (B,2)
+    inter = wh[:, 0] * wh[:, 1]                            # (B,)
+
+    # areas & union
+    area_p = (p[:, 2] - p[:, 0]).clamp(min=0) * (p[:, 3] - p[:, 1]).clamp(min=0)
+    area_g = (g[:, 2] - g[:, 0]).clamp(min=0) * (g[:, 3] - g[:, 1]).clamp(min=0)
+    union  = area_p + area_g - inter + _EPS
+    iou    = inter / union
+
+    # smallest enclosing box
+    enc_lt = torch.minimum(p[:, :2], g[:, :2])
+    enc_rb = torch.maximum(p[:, 2:], g[:, 2:])
+    enc_wh = (enc_rb - enc_lt).clamp(min=0)
+    enc_area = enc_wh[:, 0] * enc_wh[:, 1] + _EPS
+
+    giou = iou - (enc_area - union) / enc_area
+    loss = 1.0 - giou
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss  # none
+

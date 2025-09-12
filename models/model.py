@@ -1,3 +1,4 @@
+# models/model.py
 from collections import OrderedDict
 from typing import Optional
 import os, urllib.request, types
@@ -66,14 +67,10 @@ def load_weights(model: nn.Module, load_path: str) -> nn.Module:
 
 class MGVLF(nn.Module):
     """
-    Implementation đúng theo pipeline của paper RSVG/MGVLF:
-
-      Text encoder (BERT, lấy word-level + 1 sentence) →
-      CNN_MGVLF (DE: refine fv1 bằng [multi-scale vis + word + sentence]) →
-      VLFusion (encoder với [word-level tokens + 1 learnable token]) →
-      Box head (cx,cy,w,h) ∈ [0,1]
-
-    Lưu ý: Không dùng WLP/FiLM/Quality head để khớp paper gốc.
+    Text encoder (BERT: word-level + 1 sentence) →
+    CNN_MGVLF (DE refine fv1 bằng multi-scale vis + text) →
+    VLFusion (encoder với word tokens + [pr]) →
+    Box head (cx,cy,w,h) ∈ [0,1]
     """
     def __init__(self, bert_model: str = 'bert-base-uncased', tunebert: bool = True, args: Optional[object] = None):
         super(MGVLF, self).__init__()
@@ -222,7 +219,7 @@ class MGVLF(nn.Module):
         print("[DETR seed] Copied: input_proj + encoder(6) + decoder(1)")
 
     def forward(self, image, mask, word_id, word_mask, return_aux: bool = False):
-        # word ids
+        # word ids / masks
         if not torch.is_tensor(word_id):
             word_id = torch.as_tensor(word_id, dtype=torch.long, device=image.device)
         else:
@@ -233,35 +230,39 @@ class MGVLF(nn.Module):
         else:
             word_mask = word_mask.to(image.device).long()
 
+        # HF expects 1=real, 0=pad; key_padding_mask needs True=pad
+        attn_mask = word_mask                       # (B,L) with 1=real for BERT
+        key_pad   = (word_mask == 0).bool()         # (B,L) True=pad for DE/VLF
+
         # 1) text encoder
         outputs = self.textmodel(
             input_ids=word_id,
-            attention_mask=word_mask,
+            attention_mask=attn_mask,
             return_dict=True
         )
         fl = outputs.last_hidden_state
         sentence_feature = getattr(outputs, "pooler_output", None)
         if sentence_feature is None:
-            am = word_mask.unsqueeze(-1).float()
+            am = attn_mask.unsqueeze(-1).float()
             sentence_feature = (fl * am).sum(dim=1) / am.sum(dim=1).clamp_min(1.0)
 
         if not self.tunebert:
             fl = fl.detach(); sentence_feature = sentence_feature.detach()
 
-        # 2) visual encoder
+        # 2) visual encoder  —— PASS HF mask (1=real, 0=pad)
         fv = self.visumodel(image, mask, word_mask, fl, sentence_feature)
 
-        # 3) fusion
+        # 3) fusion  —— PASS HF mask (1=real, 0=pad)
         x = self.vlmodel(fv, fl, word_mask)
 
-        # 4) feature for head
+        # 4) feature for head - take [pr] token at index 0
         if x.dim() == 2 and x.size(1) == 256:
             feat = x
         elif x.dim() == 3:
             if x.size(1) == 256:
-                feat = x[:, :, -1]
+                feat = x[:, :, 0]   # (B,256,S) -> token 0
             elif x.size(2) == 256:
-                feat = x[:, -1, :]
+                feat = x[:, 0, :]   # (B,S,256) -> token 0
             else:
                 raise RuntimeError(f"Unexpected fusion output shape {x.shape}")
         else:

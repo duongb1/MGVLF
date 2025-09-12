@@ -394,7 +394,7 @@ def main():
         save_checkpoint({
             'epoch': epoch + 1,
             'state_dict': model.state_dict(),
-            'best_metric': acc_new,                 # đổi tên khóa cho đúng
+            'best_metric': acc_new,
             'optimizer': optimizer.state_dict(),
         }, is_best, args, filename=args.savename)
 

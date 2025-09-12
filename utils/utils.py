@@ -41,26 +41,50 @@ def xywh2xyxy(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
+# -------------------------
+# BBox sanitation helpers
+# -------------------------
+def _sanitize_xyxy_t(x: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure x1<=x2, y1<=y2 for torch tensors. x: (N,4)
+    """
+    x1 = torch.minimum(x[:, 0], x[:, 2])
+    y1 = torch.minimum(x[:, 1], x[:, 3])
+    x2 = torch.maximum(x[:, 0], x[:, 2])
+    y2 = torch.maximum(x[:, 1], x[:, 3])
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+
+def _sanitize_xyxy_np(x: np.ndarray) -> np.ndarray:
+    """
+    Ensure x1<=x2, y1<=y2 for numpy arrays. x: (N,4)
+    """
+    x1 = np.minimum(x[:, 0], x[:, 2])
+    y1 = np.minimum(x[:, 1], x[:, 3])
+    x2 = np.maximum(x[:, 0], x[:, 2])
+    y2 = np.maximum(x[:, 1], x[:, 3])
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+
 def bbox_iou_numpy(box1: np.ndarray, box2: np.ndarray) -> np.ndarray:
     """
     IoU giữa 2 tập bbox numpy.
     box1: (N,4), box2: (M,4), định dạng xyxy.
     return: (N, M) IoU.
     """
-    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    eps = np.finfo(np.float64).eps
+    box1 = _sanitize_xyxy_np(box1.astype(np.float64, copy=False))
+    box2 = _sanitize_xyxy_np(box2.astype(np.float64, copy=False))
 
-    iw = np.minimum(box1[:, None, 2], box2[None, :, 2]) - np.maximum(box1[:, None, 0], box2[None, :, 0])
-    ih = np.minimum(box1[:, None, 3], box2[None, :, 3]) - np.maximum(box1[:, None, 1], box2[None, :, 1])
-
-    iw = np.clip(iw, 0, None)
-    ih = np.clip(ih, 0, None)
+    iw = np.clip(np.minimum(box1[:, None, 2], box2[None, :, 2]) - np.maximum(box1[:, None, 0], box2[None, :, 0]), 0, None)
+    ih = np.clip(np.minimum(box1[:, None, 3], box2[None, :, 3]) - np.maximum(box1[:, None, 1], box2[None, :, 1]), 0, None)
     inter = iw * ih
 
-    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    ua = area1[:, None] + area2[None, :] - inter
-    ua = np.maximum(ua, np.finfo(float).eps)
+    area1 = np.clip(box1[:, 2] - box1[:, 0], 0, None) * np.clip(box1[:, 3] - box1[:, 1], 0, None)
+    area2 = np.clip(box2[:, 2] - box2[:, 0], 0, None) * np.clip(box2[:, 3] - box2[:, 1], 0, None)
 
-    return inter / ua
+    ua = area1[:, None] + area2[None, :] - inter
+    return inter / np.maximum(ua, eps)
 
 
 def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, x1y1x2y2: bool = True):
@@ -69,30 +93,26 @@ def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, x1y1x2y2: bool = True):
     - Nếu x1y1x2y2=True, cả 2 là xyxy; ngược lại, là cxcywh.
     Trả về: (iou, inter_area, union_area) đều là Tensor dạng (N,).
     """
-    eps = 1e-16
-    if x1y1x2y2:
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
-    else:
-        b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] * 0.5, box1[:, 0] + box1[:, 2] * 0.5
-        b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] * 0.5, box1[:, 1] + box1[:, 3] * 0.5
-        b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] * 0.5, box2[:, 0] + box2[:, 2] * 0.5
-        b2_y1, b2_y2 = box2[:, 1] - box2[:, 3] * 0.5, box2[:, 1] + box2[:, 3] * 0.5
+    eps = 1e-7
+    if not x1y1x2y2:
+        box1 = xywh2xyxy(box1)
+        box2 = xywh2xyxy(box2)
+    box1 = _sanitize_xyxy_t(box1)
+    box2 = _sanitize_xyxy_t(box2)
 
-    inter_rect_x1 = torch.max(b1_x1, b2_x1)
-    inter_rect_y1 = torch.max(b1_y1, b2_y1)
-    inter_rect_x2 = torch.min(b1_x2, b2_x2)
-    inter_rect_y2 = torch.min(b1_y2, b2_y2)
+    inter_x1 = torch.maximum(box1[:, 0], box2[:, 0])
+    inter_y1 = torch.maximum(box1[:, 1], box2[:, 1])
+    inter_x2 = torch.minimum(box1[:, 2], box2[:, 2])
+    inter_y2 = torch.minimum(box1[:, 3], box2[:, 3])
 
-    inter_w = torch.clamp(inter_rect_x2 - inter_rect_x1, min=0)
-    inter_h = torch.clamp(inter_rect_y2 - inter_rect_y1, min=0)
+    inter_w = (inter_x2 - inter_x1).clamp(min=0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0)
     inter_area = inter_w * inter_h
 
-    b1_area = (b1_x2 - b1_x1).clamp(min=0) * (b1_y2 - b1_y1).clamp(min=0)
-    b2_area = (b2_x2 - b2_x1).clamp(min=0) * (b2_y2 - b2_y1).clamp(min=0)
-    union_area = b1_area + b2_area - inter_area + eps
-
-    iou = inter_area / union_area
+    a1 = (box1[:, 2] - box1[:, 0]).clamp(min=0) * (box1[:, 3] - box1[:, 1]).clamp(min=0)
+    a2 = (box2[:, 2] - box2[:, 0]).clamp(min=0) * (box2[:, 3] - box2[:, 1]).clamp(min=0)
+    union_area = a1 + a2 - inter_area
+    iou = inter_area / union_area.clamp_min(eps)
     return iou, inter_area, union_area
 
 
@@ -145,10 +165,14 @@ def compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
 
 def adjust_learning_rate(args, optimizer, epoch: int):
     """
-    LR decay sau epoch 60 (giống code cũ).
+    LR decay theo tham số, mặc định drop tại epoch 60.
     Tương thích 2 nhóm (rest, visu) hoặc 3 nhóm (rest, visu, text).
     """
-    lr = args.lr * args.lr_dec if epoch >= 60 else args.lr
+    drop_at = getattr(args, "lr_drop", 60)
+    dec = getattr(args, "lr_dec", 0.1)
+    base_lr = getattr(args, "lr", 1e-4)
+    lr = base_lr * dec if epoch >= drop_at else base_lr
+
     # group 0: rest
     optimizer.param_groups[0]['lr'] = lr
     # group 1: visu

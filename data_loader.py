@@ -72,8 +72,16 @@ class RSVGDataset(data.Dataset):
 
         # NHẬN mask bool 2D từ letterbox
         img, pad_mask, ratio, dw, dh = letterbox(img, None, self.imsize)
-        bbox[0], bbox[2] = bbox[0] * ratio + dw, bbox[2] * ratio + dw
-        bbox[1], bbox[3] = bbox[1] * ratio + dh, bbox[3] * ratio + dh
+        
+        # Fix ratio handling - check if ratio is tuple/list
+        if isinstance(ratio, (tuple, list, np.ndarray)):
+            rx, ry = float(ratio[0]), float(ratio[1])
+        else:
+            rx = ry = float(ratio)
+        
+        # Scale bbox coordinates
+        bbox[0], bbox[2] = bbox[0] * rx + dw, bbox[2] * rx + dw
+        bbox[1], bbox[3] = bbox[1] * ry + dh, bbox[3] * ry + dh
 
         if self.transform is not None:
             img = self.transform(img)  # ToTensor + Normalize
