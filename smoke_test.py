@@ -102,19 +102,38 @@ def sanity_iou_one():
 def build_args_shim(device: str):
     class A: pass
     a = A()
+    # ---- core ----
+    a.device = device
     a.backbone = 'resnet50'
     a.img_pe_type = 'sine'
     a.dilation = False
-    a.masks = True           # cần intermediate layers
+    a.masks = True
     a.hidden_dim = 256
+
+    # ---- transformer defaults (DETR-style) ----
+    a.dropout = 0.1
+    a.nheads = 8
+    a.dim_feedforward = 2048
+    a.enc_layers = 6          # encoder layers cho EN & VLFusion
+    a.dec_layers = 1          # decoder layers cho DE (refine 1 lượt)
+    a.pre_norm = False
+    a.activation = 'relu'
+    a.return_intermediate_dec = False
+    a.num_queries = 100       # nếu builder có dùng, không hại
+
+    # ---- lr/freeze ----
     a.lr = 1e-4
     a.lr_backbone = 1e-5
     a.lr_drop = 60
     a.lr_dec = 0.1
+
+    # ---- fusion PE ----
     a.fusion_pe_max_len = 4096
-    a.device = device
+
+    # ---- no extra pretrain here ----
     a.pretrain = ""
     return a
+
 
 
 # ---------- hook lấy output chuỗi cuối của VLFusion ----------
