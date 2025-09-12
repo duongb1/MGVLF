@@ -102,6 +102,7 @@ class CNN_MGVLF(nn.Module):
                     nn.GroupNorm(32, hidden_dim),
                 ) for c in num_chs
             ])
+            assert len(self.input_proj) == 3, "expect proj for C3,C4,C5"
         self.l_proj = torch.nn.Sequential(nn.Linear(768, hidden_dim), nn.ReLU(), )
 
     def get_mask(self, nextFeatureMap, beforeMask):
@@ -171,15 +172,13 @@ class CNN_MGVLF(nn.Module):
 
         # 2D positional encodings for each level (match dtype with tensors)
         # Get pos from backbone output properly
-        if pos is None and len(outs) > 1:
-            pos = outs[1]
-        
         if pos is not None:
             pos1 = pos[-1] if isinstance(pos, list) else pos
         else:
             # Generate pos encoding if not available
-            pos1 = self.pos(NestedTensor(v_single, mask4)).to(v_single.dtype)
+            pos1 = self.pos(NestedTensor(v_single, mask4))
         
+        pos1 = pos1.to(v_single.dtype)
         pos2 = self.pos(NestedTensor(conv6_2, fv2_mask)).to(conv6_2.dtype)
         pos3 = self.pos(NestedTensor(conv7_2, fv3_mask)).to(conv7_2.dtype)
         pos4 = self.pos(NestedTensor(conv8_2, fv4_mask)).to(conv8_2.dtype)
@@ -213,7 +212,8 @@ class CNN_MGVLF(nn.Module):
 
         # pos for text (use embedding slice up to Nt+1)
         Nt = wordFeature.size(1)   # number of word tokens before adding sentence token
-        flpos = self.text_pos_embed.weight[:Nt+1].unsqueeze(1).repeat(1, bs, 1)  # (Nt+1,B,256)
+        idx = torch.arange(Nt+1, device=wordFeature.device)
+        flpos = self.text_pos_embed(idx).unsqueeze(1).repeat(1, bs, 1)  # (Nt+1,B,256)
 
         # concat pos and tokens for DE stage
         fvl = torch.cat((fv, fl), dim=0)                 # (Lv+L+1, B, 256)
